@@ -1,22 +1,21 @@
-"""Rotating "come join the dance floor" banner."""
+"""Funny "come join the dance floor" messages that pop up every so often.
+
+Messages come from shuffled decks (see messages.py), so every message is shown once
+before any repeats. Half the time, if one fits, the banner picks a message written for
+the moment instead: how busy the floor is, the time of night, or a live skeleton count.
+"""
 
 import math
+import random
+from datetime import datetime
+from collections import OrderedDict, deque
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-MESSAGES = [
-    "NO BODY DANCES ALONE - JOIN THE SKELETON CREW!",
-    "THE DEAD ARE DANCING. WHAT'S YOUR EXCUSE?",
-    "SHAKE YOUR BONES ON THE DANCE FLOOR!",
-    "DON'T BE A DEADBEAT - COME DANCE!",
-    "THE DJ IS DEAD. THE PARTY ISN'T.",
-    "GET IN HERE BEFORE YOU GHOST US",
-    "BONE-AFIDE DANCE PARTY IN PROGRESS",
-    "RATTLE THOSE BONES - GET ON THE FLOOR!",
-]
+from . import messages
 
 FONT_CANDIDATES = [
     "/System/Library/Fonts/Supplemental/Chalkduster.ttf",
@@ -32,18 +31,123 @@ def _find_font() -> Optional[str]:
     return next((p for p in FONT_CANDIDATES if Path(p).exists()), None)
 
 
-class JoinBanner:
-    def __init__(self, seconds_per_message: float = 8.0):
-        self.seconds = seconds_per_message
-        self.font_path = _find_font()
-        self._cache: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
+class ShuffleBag:
+    """Hands out every item once, in random order, before repeating any. When it reshuffles,
+    the most recently shown third goes to the back of the new deck, so a message from the end
+    of one round can't pop up again right at the start of the next."""
 
-    def _render(self, idx: int, frame_w: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Returns (premultiplied BGR float32, alpha float32) for message idx."""
-        key = (idx, frame_w)
+    def __init__(self, items: List[str], rng: random.Random):
+        self.items = list(items)
+        self.rng = rng
+        self.bag: List[str] = []  # popped from the end
+        self.recent: Deque[str] = deque(maxlen=max(1, len(items) // 3))
+
+    def next(self) -> str:
+        if not self.bag:
+            fresh = [m for m in self.items if m not in self.recent]
+            held_back = [m for m in self.items if m in self.recent]
+            self.rng.shuffle(fresh)
+            self.rng.shuffle(held_back)
+            self.bag = held_back + fresh
+        item = self.bag.pop()
+        self.recent.append(item)
+        return item
+
+
+def _floor_pool(most: int) -> str:
+    if most == 0:
+        return "EMPTY"
+    if most == 1:
+        return "SOLO"
+    if most <= 5:
+        return "FEW"
+    if most <= 19:
+        return "CROWD"
+    return "PACKED"
+
+
+def _clock_pools(now: datetime) -> List[str]:
+    minutes = now.hour * 60 + now.minute
+    pools = []
+    if 17 * 60 <= minutes < 21 * 60:
+        pools.append("EARLY")
+    if minutes >= 23 * 60 + 45 or minutes < 15:
+        pools.append("WITCHING")
+    if 60 <= minutes < 5 * 60:
+        pools.append("LATE")
+    if 105 <= minutes < 5 * 60:
+        pools.append("LAST_CALL")
+    return pools
+
+
+def _clock_text(now: datetime) -> str:
+    return f"{now.hour % 12 or 12}:{now.minute:02d} {'AM' if now.hour < 12 else 'PM'}"
+
+
+class JoinBanner:
+    SITUATION_WINDOW = 5.0  # seconds of dancer counts used to judge the moment
+    SITUATION_CHANCE = 0.5  # how often a fitting situational message wins over a general one
+    # Situational decks are small, so each is rationed (seconds between uses)
+    COOLDOWNS = {"EMPTY": 150, "SOLO": 150, "FEW": 150, "CROWD": 150, "PACKED": 150,
+                 "EARLY": 300, "WITCHING": 240, "LATE": 300, "LAST_CALL": 300,
+                 "LIVE_COUNT": 420, "LIVE_TIME": 900}  # fmt: skip
+    FADE = 0.6
+
+    def __init__(self, every: float = 30.0, show_for: float = 8.0, seed: Optional[int] = None):
+        self.every = max(every, show_for + 1.0)
+        self.show_for = show_for
+        self.rng = random.Random(seed)
+        self.bags = {name: ShuffleBag(getattr(messages, name), self.rng) for name in ["GENERAL", *self.COOLDOWNS]}
+        self.last_used: Dict[str, float] = {name: -math.inf for name in self.COOLDOWNS}
+        self.font_path = _find_font()
+        self._cache: "OrderedDict[Tuple[str, int], Tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+        self.counts: Deque[Tuple[float, int]] = deque()
+        self.current: Optional[str] = None
+        self.started = 0.0
+        self.next_at: Optional[float] = None
+
+    def _situations(self, t: float, most: int) -> List[str]:
+        """Situational pools that fit right now and aren't on cooldown."""
+        now = datetime.fromtimestamp(t)
+        fits = [_floor_pool(most), *_clock_pools(now)]
+        minutes = now.hour * 60 + now.minute
+        if not 17 * 60 <= minutes < 21 * 60 + 30:
+            fits.append("LIVE_TIME")  # announcing the time only gets fun once the night is going
+        if most >= 2:
+            fits.append("LIVE_COUNT")
+        return [p for p in fits if t - self.last_used[p] >= self.COOLDOWNS[p]]
+
+    def _pick(self, t: float) -> str:
+        most = max((c for _, c in self.counts), default=0)
+        candidates = self._situations(t, most)
+        if candidates and self.rng.random() < self.SITUATION_CHANCE:
+            pool = self.rng.choice(candidates)
+            self.last_used[pool] = t
+        else:
+            pool = "GENERAL"
+        text = self.bags[pool].next()
+        if pool.startswith("LIVE_"):
+            text = text.format(n=most, next=most + 1, time=_clock_text(datetime.fromtimestamp(t)))
+        return text
+
+    def _schedule(self, t: float) -> None:
+        if self.current is None and self.next_at is None:
+            self.next_at = t + 3.0  # first message shortly after startup
+        if self.current is not None and t - self.started >= self.show_for:
+            self.current = None
+            # A little randomness in the gap so it doesn't feel like a metronome
+            self.next_at = t + (self.every - self.show_for) * self.rng.uniform(0.75, 1.25)
+        if self.current is None and self.next_at is not None and t >= self.next_at:
+            self.current = self._pick(t)
+            self.started = t
+            self.next_at = None
+
+    def _render(self, text: str, frame_w: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Returns (premultiplied BGR float32, alpha float32) for a message."""
+        key = (text, frame_w)
         if key in self._cache:
+            self._cache.move_to_end(key)
             return self._cache[key]
-        text = MESSAGES[idx]
         size = max(18, frame_w // 30)
         font = ImageFont.truetype(self.font_path, size) if self.font_path else ImageFont.load_default(size)
         while size > 14:
@@ -78,20 +182,28 @@ class JoinBanner:
         )
         result = (rgb[..., ::-1].copy(), alpha)
         self._cache[key] = result
+        while len(self._cache) > 3:  # each rendered message is a few MB
+            self._cache.popitem(last=False)
         return result
 
-    def draw(self, frame: np.ndarray, t: float) -> None:
-        """Composites the current message onto the bottom of the frame, in place."""
+    def draw(self, frame: np.ndarray, t: float, dancer_count: int = 0) -> None:
+        """Composites the current message (if one is showing) onto the bottom of the frame, in place."""
+        self.counts.append((t, dancer_count))
+        while self.counts and self.counts[0][0] < t - self.SITUATION_WINDOW:
+            self.counts.popleft()
+        self._schedule(t)
+        if self.current is None:
+            return
+
         h, w = frame.shape[:2]
-        idx = int(t // self.seconds) % len(MESSAGES)
-        phase = (t % self.seconds) / self.seconds
-        fade = min(1.0, phase / 0.08, (1.0 - phase) / 0.08)
+        age = t - self.started
+        fade = min(1.0, age / self.FADE, (self.show_for - age) / self.FADE)
         flicker = 0.9 + 0.1 * math.sin(t * 11.0) * math.sin(t * 3.7)
         strength = max(0.0, fade) * flicker
         if strength <= 0.01:
             return
 
-        rgb, alpha = self._render(idx, w)
+        rgb, alpha = self._render(self.current, w)
         bh, bw = alpha.shape
         bob = int(math.sin(t * 2.2) * h * 0.004)
         x = max(0, (w - bw) // 2)

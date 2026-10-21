@@ -40,11 +40,12 @@ import cv2
 import numpy as np
 
 from .banner import JoinBanner
-from .cloak import InvisibilityCloak
+from .cloak import InvisibilityCloak, upscale_region
 from .config import LOCAL_DIR, MODELS_DIR, load_env, redact, rtsp_url_from_env
 from .display import FullscreenController, find_screen, screen_names
-from .anatomy import CONF_THRESH, L_AN, R_AN
+from .anatomy import CONF_THRESH, L_AN, L_KN, R_AN, R_KN
 from .skeleton import PALETTE_NAMES, SkeletonCanvas, draw_dancers
+from .segproc import SegmentationProcess, half_shape, segment_people
 from .stream import LowLatencyStreamReader
 from .tracking import Dancer, PoseSmoother
 from .zones import IgnoreZones
@@ -54,6 +55,7 @@ WINDOW_NAME = "Halloween Skeleton Party Cam"
 BG_INVISIBLE, BG_DIM, BG_VOID, BG_SPECTRAL = 1, 2, 3, 4
 TRAIL_PRESETS = [0.80, 0.90, 0.65, 0.0]  # Medium, Long Ghost Echo, Short, Off
 TRAIL_OFF = TRAIL_PRESETS.index(0.0)
+SEG_CONF = 0.25
 
 # Limb segments painted into the person mask, on top of the segmentation mask, so
 # fast-moving arms the segmenter misses still get erased.
@@ -64,7 +66,7 @@ MASK_LIMBS = [(5, 7), (7, 9), (6, 8), (8, 10), (11, 13), (13, 15), (12, 14), (14
 class Analysis:
     frame: np.ndarray
     dancers: List[Dancer]
-    segments: list  # person outline polygons from the segmentation model
+    seg_mask: Optional[np.ndarray]  # half-resolution mask of everyone the segmentation model found
 
 
 class PartyCam:
@@ -81,7 +83,14 @@ class PartyCam:
         self.device = device
         print(f"[*] Loading models on device='{device}'...")
         self.pose_model = YOLO(str(MODELS_DIR / args.pose_model))
-        self.seg_model = YOLO(str(MODELS_DIR / args.seg_model))
+        self.seg_model = YOLO(str(MODELS_DIR / args.seg_model))  # also the fallback if the process fails
+        self.segproc: Optional[SegmentationProcess] = None
+        self.seg_frame = 0
+        self.last_seg_mask: Optional[np.ndarray] = None
+        try:
+            self.segproc = SegmentationProcess(str(MODELS_DIR / args.seg_model), args.seg_imgsz, SEG_CONF, device)
+        except Exception as e:
+            print(f"[!] Couldn't start the segmentation process ({e}); running it in-thread (slower)")
 
         self.smoother = PoseSmoother()
         # One saved floor image per video source, so a webcam test never pollutes the party camera's
@@ -90,7 +99,7 @@ class PartyCam:
         if args.fresh_background:
             self.cloak.plate_path.unlink(missing_ok=True)
         self.zones = IgnoreZones(LOCAL_DIR / "ignore_zones.json")
-        self.banner = JoinBanner()
+        self.banner = JoinBanner(every=args.banner_every)
 
         self.bg_mode = BG_INVISIBLE
         self.show_skulls = True
@@ -129,9 +138,30 @@ class PartyCam:
             raw = cv2.resize(raw, (self.args.width, int(h * self.args.width / w)), interpolation=cv2.INTER_LINEAR)
         return raw
 
-    def detect(self, frame: np.ndarray) -> Tuple[List[Dancer], list]:
+    def detect(self, frame: np.ndarray) -> Tuple[List[Dancer], Optional[np.ndarray]]:
         h, w = frame.shape[:2]
         zone_boxes = self.zones.pixel_boxes(w, h)
+
+        # Segmentation runs in its own process at the same time as pose, below. The GPU is
+        # saturated running both models every frame, so with --seg-every 2 it runs every other
+        # frame and the mask in between is reused (person_mask also holds the previous frame's
+        # mask and paints everyone's current limbs on top, so a 50 ms-old outline still covers).
+        need_seg = self.bg_mode == BG_INVISIBLE or self.cloak.coverage < 0.97
+        self.seg_frame += 1
+        reuse = (
+            self.last_seg_mask is not None
+            and self.last_seg_mask.shape == half_shape(h, w)
+            and self.seg_frame % max(1, self.args.seg_every) != 0
+        )
+        if need_seg and reuse:
+            need_seg = False
+        submitted = False
+        if need_seg and self.segproc is not None:
+            try:
+                self.segproc.submit(frame, zone_boxes)
+                submitted = True
+            except (OSError, ValueError) as e:
+                self._drop_segproc(e)
 
         r = self.pose_model.track(
             frame, persist=True, imgsz=self.args.imgsz, conf=self.args.conf,
@@ -147,31 +177,54 @@ class PartyCam:
                     dancers.append(Dancer(kpts=k, box=b, track_id=tid))
         dancers = self.smoother.update(dancers)
 
-        segments = []
-        if self.bg_mode == BG_INVISIBLE or self.cloak.coverage < 0.97:
-            s = self.seg_model.predict(
-                frame, classes=[0], imgsz=self.args.seg_imgsz, conf=0.25, device=self.device, verbose=False
-            )[0]
-            if s.masks is not None:
-                for b, poly in zip(s.boxes.xyxy.cpu().numpy(), s.masks.xy):
-                    if len(poly) >= 3 and not self.zones.should_ignore(b, zone_boxes):
-                        segments.append(poly)
-        return dancers, segments
+        if not need_seg:
+            if not reuse:
+                return dancers, None
+            # Widen the reused outline a little to cover a frame's worth of movement
+            grow = max(3, h // 120) | 1
+            return dancers, cv2.dilate(self.last_seg_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow, grow)))
+        seg_mask = None
+        if submitted:
+            try:
+                seg_mask = self.segproc.result()
+            except (RuntimeError, OSError, EOFError) as e:
+                self._drop_segproc(e)
+        if seg_mask is None:
+            seg_mask = np.zeros(half_shape(h, w), np.uint8)
+            segment_people(self.seg_model, frame, self.args.seg_imgsz, SEG_CONF, self.device, zone_boxes, seg_mask)
+        self.last_seg_mask = seg_mask
+        return dancers, seg_mask
 
-    def person_mask(self, shape, dancers: List[Dancer], segments: list) -> Tuple[np.ndarray, np.ndarray]:
+    def _drop_segproc(self, error: Exception) -> None:
+        print(f"[!] Segmentation process failed ({error}); running it in-thread from now on (slower)")
+        if self.segproc is not None:
+            self.segproc.close()
+        self.segproc = None
+
+    def close(self) -> None:
+        if self.segproc is not None:
+            self.segproc.close()
+            self.segproc = None
+
+    def person_mask(self, shape, dancers: List[Dancer], seg_mask: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
         """Returns (binary mask, feathered float alpha) covering everyone, at full resolution.
         Built at half resolution since it gets dilated and blurred anyway."""
         h, w = shape[:2]
         sh, sw = h // 2, w // 2
-        mask = np.zeros((sh, sw), np.uint8)
-        for poly in segments:
-            cv2.fillPoly(mask, [(poly * 0.5).astype(np.int32)], 255)
+        mask = seg_mask.copy() if seg_mask is not None and seg_mask.shape == (sh, sw) else np.zeros((sh, sw), np.uint8)
         for d in dancers:
             th = max(2, int(d.height * 0.065))
             k = d.kpts
             for a, b in MASK_LIMBS:
                 if k[a, 2] >= CONF_THRESH and k[b, 2] >= CONF_THRESH:
                     cv2.line(mask, (int(k[a, 0] / 2), int(k[a, 1] / 2)), (int(k[b, 0] / 2), int(k[b, 1] / 2)), 255, th)
+            # Feet: shoes extend past the ankle keypoint, and they're what leaks when people bounce
+            for knee_i, ankle_i in ((L_KN, L_AN), (R_KN, R_AN)):
+                if k[ankle_i, 2] >= CONF_THRESH:
+                    ankle = k[ankle_i, :2]
+                    down = ankle - k[knee_i, :2] if k[knee_i, 2] >= CONF_THRESH else np.array([0.0, d.height * 0.25])
+                    toe = ankle + down * 0.25
+                    cv2.line(mask, (int(ankle[0] / 2), int(ankle[1] / 2)), (int(toe[0] / 2), int(toe[1] / 2)), 255, th)
             if d.head is not None:
                 c, rad, _ = d.head
                 cv2.circle(mask, (int(c[0] / 2), int(c[1] / 2)), int(rad * 0.75), 255, -1)
@@ -205,9 +258,9 @@ class PartyCam:
     def analyze(self, raw: np.ndarray) -> Analysis:
         frame = self.prepare(raw)
         t0 = time.perf_counter()
-        dancers, segments = self.detect(frame)
+        dancers, seg_mask = self.detect(frame)
         self.timings["detect"] = time.perf_counter() - t0
-        return Analysis(frame, dancers, segments)
+        return Analysis(frame, dancers, seg_mask)
 
     def render(self, a: Analysis, now: Optional[float] = None) -> np.ndarray:
         now = time.time() if now is None else now
@@ -219,7 +272,7 @@ class PartyCam:
 
         need_gray = self.bg_mode != BG_INVISIBLE
         gray_blur = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (9, 9), 0) if need_gray else None
-        mask, alpha = self.person_mask(frame.shape, dancers, a.segments)
+        mask, alpha = self.person_mask(frame.shape, dancers, a.seg_mask)
         bg = self.background(frame, mask, alpha, gray_blur)
         t1 = time.perf_counter()
 
@@ -243,7 +296,7 @@ class PartyCam:
         if self.mirror:
             out = cv2.flip(out, 1)
         if self.show_banner:
-            self.banner.draw(out, now)
+            self.banner.draw(out, now, self.dancer_count)
         t2 = time.perf_counter()
         self.timings.update(background=t1 - t0, render=t2 - t1)
         return out
@@ -290,27 +343,26 @@ class PartyCam:
         # Bones stay brighter than their surroundings so they read, but follow the room's light
         intensity = np.clip(0.5 + luma / 120.0, 0.5, 1.1)
         tint = np.clip(1.0 + 0.6 * ((small + 12.0) / (luma[..., None] + 12.0) - 1.0), 0.5, 1.5)
-        light_small = (tint * intensity[..., None]).astype(np.float32)
+        # As 8-bit with 128 = 1.0, so the full-size multiply below stays on fast integer paths
+        light_small = np.clip(tint * intensity[..., None] * 128.0, 0, 255).astype(np.uint8)
 
         # Pad so the softening blur isn't clipped at the box edge
         x, y = max(0, x - 3), max(0, y - 3)
         rw, rh = min(w - x, rw + 6), min(h - y, rh + 6)
         roi = (slice(y, y + rh), slice(x, x + rw))
         # Upscale only the part of the (very smooth) light map that covers the skeletons
-        sx0, sy0 = x // G, y // G
-        sx1, sy1 = min(light_small.shape[1], (x + rw) // G + 2), min(light_small.shape[0], (y + rh) // G + 2)
-        light = cv2.resize(light_small[sy0:sy1, sx0:sx1], ((sx1 - sx0) * G, (sy1 - sy0) * G), interpolation=cv2.INTER_LINEAR)
-        light = light[y - sy0 * G : y - sy0 * G + rh, x - sx0 * G : x - sx0 * G + rw]
-        if light.shape[:2] != (rh, rw):  # frame size isn't a multiple of G at the right/bottom edge
-            light = cv2.copyMakeBorder(light, 0, rh - light.shape[0], 0, rw - light.shape[1], cv2.BORDER_REPLICATE)
+        light = upscale_region(light_small, G, x, y, rw, rh)
         soft = 0.7
-        color = cv2.GaussianBlur(canvas.color[roi], (0, 0), soft).astype(np.float32) * light
+        color = cv2.multiply(cv2.GaussianBlur(canvas.color[roi], (0, 0), soft), light, scale=1.0 / 128.0)
         alpha = cv2.GaussianBlur(canvas.alpha[roi], (0, 0), soft)
         if self.grain > 0.5:
+            # Monochrome grain, weighted by coverage (premultiplied), added/subtracted with saturation
             noise = np.empty((rh, rw), np.float32)
             cv2.randn(noise, 0.0, self.grain)
-            color += (noise * (alpha.astype(np.float32) / 255.0))[..., None]
-        canvas.color[roi] = np.clip(color, 0, 255).astype(np.uint8)
+            noise = cv2.multiply(noise, alpha, scale=1.0 / 255.0, dtype=cv2.CV_32F)
+            color = cv2.add(color, cv2.merge([cv2.convertScaleAbs(cv2.max(noise, 0.0))] * 3))
+            color = cv2.subtract(color, cv2.merge([cv2.convertScaleAbs(cv2.min(noise, 0.0))] * 3))
+        canvas.color[roi] = color
         canvas.alpha[roi] = alpha
 
     def process(self, raw: np.ndarray, now: Optional[float] = None) -> np.ndarray:
@@ -321,12 +373,12 @@ class PartyCam:
         # Cheap wide bloom: blur at quarter resolution
         small = cv2.resize(canvas.glow, (w // 4, h // 4), interpolation=cv2.INTER_AREA)
         small = cv2.GaussianBlur(small, (0, 0), 2.5)
-        bloom = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
         glow_gain = 0.55 if palette == "bone" else 1.35
-        out = cv2.addWeighted(bg, 1.0, bloom, glow_gain, 0)
-
         decay = TRAIL_PRESETS[self.trail_idx]
+
         if decay > 0:
+            bloom = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+            out = cv2.addWeighted(bg, 1.0, bloom, glow_gain, 0)
             # Phantom trails drift upward like rising spirits
             self.trail[:-2] = self.trail[2:]
             self.trail[-2:] = 0
@@ -335,10 +387,24 @@ class PartyCam:
             out = cv2.add(out, cv2.convertScaleAbs(self.trail, alpha=0.6))
         else:
             self.trail.fill(0)
+            out = bg.copy()
+            # Without trails, only the area around the glow needs the bloom added
+            gx, gy, gw, gh = cv2.boundingRect(small.max(axis=2))
+            if gw and gh:
+                pad = 8  # blur reach, in quarter-res pixels
+                gx, gy = max(0, gx - pad), max(0, gy - pad)
+                gw, gh = min(small.shape[1] - gx, gw + 2 * pad), min(small.shape[0] - gy, gh + 2 * pad)
+                x, y, rw, rh = gx * 4, gy * 4, min(w - gx * 4, gw * 4), min(h - gy * 4, gh * 4)
+                bloom = upscale_region(small, 4, x, y, rw, rh)
+                out[y : y + rh, x : x + rw] = cv2.addWeighted(bg[y : y + rh, x : x + rw], 1.0, bloom, glow_gain, 0)
 
-        inv = cv2.merge([cv2.bitwise_not(canvas.alpha)] * 3)
-        out = cv2.multiply(out, inv, scale=1.0 / 255.0)
-        return cv2.add(out, canvas.color)
+        # Skeletons over everything, only where they are
+        x, y, rw, rh = cv2.boundingRect(canvas.alpha)
+        if rw and rh:
+            roi = (slice(y, y + rh), slice(x, x + rw))
+            inv = cv2.merge([cv2.bitwise_not(canvas.alpha[roi])] * 3)
+            out[roi] = cv2.add(cv2.multiply(out[roi], inv, scale=1.0 / 255.0), canvas.color[roi])
+        return out
 
 
 class DetectionWorker(threading.Thread):
@@ -402,15 +468,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--source", help="Camera index ('0' = webcam), RTSP URL, or video file. Default: camera from .env")
     p.add_argument("--pose-model", default="yolo11s-pose.pt", help="Ultralytics pose weights (downloaded to models/)")
     p.add_argument("--seg-model", default="yolo11s-seg.pt", help="Ultralytics segmentation weights (downloaded to models/)")
-    p.add_argument("--imgsz", type=int, default=960, help="Pose inference size; bigger finds smaller/farther dancers")
-    p.add_argument("--seg-imgsz", type=int, default=640, help="Segmentation inference size")
-    p.add_argument("--conf", type=float, default=0.30, help="Person detection confidence threshold")
+    p.add_argument("--imgsz", type=int, default=1280, help="Pose inference size; bigger finds smaller/farther/partly hidden dancers")
+    p.add_argument("--seg-imgsz", type=int, default=960, help="Segmentation inference size; bigger erases more of a packed crowd")
+    p.add_argument("--conf", type=float, default=0.25, help="Person detection confidence threshold")
+    p.add_argument("--seg-every", type=int, default=2, help="Run person segmentation every N frames (1 = every frame, slower)")
     p.add_argument("--width", type=int, default=1920, help="Processing/output width (camera frames are downscaled to this)")
     p.add_argument("--room-brightness", type=float, default=0.85, help="Room brightness in invisible mode (0-1)")
     p.add_argument("--display", help="Start fullscreen on this display (index or name substring, e.g. 'TV')")
     p.add_argument("--list-displays", action="store_true", help="List displays and exit")
     p.add_argument("--mirror", action="store_true", help="Start mirrored")
     p.add_argument("--no-banner", action="store_true", help="Start with the 'join the dance floor' banner off")
+    p.add_argument("--banner-every", type=float, default=30.0, help="Show a banner message about every N seconds")
     p.add_argument("--fresh-background", action="store_true", help="Forget the saved empty-floor image")
     return p.parse_args()
 
@@ -526,6 +594,7 @@ def main() -> None:
     finally:
         worker.stop()
         cam.cloak.save()
+        cam.close()
         stream.stop()
         cv2.destroyAllWindows()
 

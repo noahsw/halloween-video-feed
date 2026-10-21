@@ -43,6 +43,11 @@ PALETTES = {
 }
 PALETTE_NAMES = list(PALETTES)
 
+# Below this bone thickness (a dancer roughly 240 px tall, i.e. at the back of the room),
+# fine details like finger bones and paired forearm bones are a few pixels wide and unreadable
+# on the TV, so they're skipped. That keeps a packed dance floor cheap to draw.
+DETAIL_MIN_T = 5.0
+
 
 class SkeletonCanvas:
     def __init__(self, shape: Tuple[int, ...]):
@@ -75,6 +80,7 @@ class BonePen:
         self.a = int(255 * opacity)
         self.opacity = opacity
         self.t = t
+        self.detailed = t >= DETAIL_MIN_T
         self.outline = max(1, int(round(t * 0.35)))
 
     def _opaque(self, draw, color, thickness: int) -> None:
@@ -85,20 +91,20 @@ class BonePen:
         th = max(1, int(round(self.t * scale)))
         line = lambda img, col, w: cv2.line(img, p1, p2, col, w, cv2.LINE_AA)
         self._opaque(line, self.shadow, th + 2 * self.outline)
-        self._opaque(line, self.ivory, th)
+        line(self.c.color, self.ivory, th)  # the outline pass already set coverage here
 
     def knob(self, p: Point, scale: float = 1.0) -> None:
         r = max(1, int(round(self.t * 0.75 * scale)))
         circ = lambda img, col, w: cv2.circle(img, p, w, col, -1, cv2.LINE_AA)
         self._opaque(circ, self.shadow, r + self.outline)
-        self._opaque(circ, self.ivory, r)
+        circ(self.c.color, self.ivory, r)
 
     def curve(self, pts: np.ndarray, scale: float = 1.0, closed: bool = False) -> None:
         th = max(1, int(round(self.t * scale)))
         pts = pts.astype(np.int32).reshape((-1, 1, 2))
         poly = lambda img, col, w: cv2.polylines(img, [pts], closed, col, w, cv2.LINE_AA)
         self._opaque(poly, self.shadow, th + 2 * self.outline)
-        self._opaque(poly, self.ivory, th)
+        poly(self.c.color, self.ivory, th)
 
     def solid(self, pts: np.ndarray) -> None:
         """Filled bone surface (cranium, pelvis)."""
@@ -135,6 +141,7 @@ class NeonPen:
         self.white = _scale((255, 255, 255), opacity)
         self.a = int(255 * opacity)
         self.t = t
+        self.detailed = t >= DETAIL_MIN_T
 
     def _core(self, draw, thickness: int) -> None:
         draw(self.c.color, self.core, thickness)
@@ -221,12 +228,15 @@ def _draw_ribcage(pen, sh_mid, hip_mid, l_sh, r_sh, show_ribs: bool) -> None:
     sh_w = max(float(np.linalg.norm(l_sh - r_sh)), MIN_WIDTH_TO_TORSO * torso_len)
 
     # Vertebrae
-    n_vert = 9
+    n_vert = 9 if pen.detailed else 5
     for i in range(n_vert + 1):
         pen.knob(_ipt(sh_mid + spine_vec * (i / n_vert)), 0.55)
 
     if show_ribs:
-        for frac, w_scale in zip([0.12, 0.23, 0.34, 0.45, 0.55], [0.40, 0.47, 0.48, 0.44, 0.36]):
+        ribs = zip([0.12, 0.23, 0.34, 0.45, 0.55], [0.40, 0.47, 0.48, 0.44, 0.36])
+        if not pen.detailed:
+            ribs = zip([0.15, 0.32, 0.5], [0.42, 0.48, 0.40])
+        for frac, w_scale in ribs:
             center = sh_mid + u_spine * torso_len * frac
             half_w = sh_w * w_scale
             dip = u_spine * torso_len * 0.06
@@ -248,6 +258,8 @@ def _draw_ribcage(pen, sh_mid, hip_mid, l_sh, r_sh, show_ribs: bool) -> None:
     for s in (-1.0, 1.0):
         wing = [(0, -0.14), (s * 0.55, -0.22), (s * 1.0, -0.12), (s * 0.85, 0.02), (s * 0.6, 0.08), (s * 0.25, 0.12), (0, 0.06)]
         pen.solid(np.array([L(*p) for p in wing]))
+        if not pen.detailed:
+            continue
         ring = [(s * 0.6, 0.08), (s * 0.58, 0.22), (s * 0.2, 0.26), (0, 0.2)]
         pen.curve(np.array([L(*p) for p in ring]), 0.6)
         hole = [(s * 0.48, 0.12), (s * 0.44, 0.2), (s * 0.24, 0.2), (s * 0.28, 0.13)]
@@ -257,6 +269,9 @@ def _draw_ribcage(pen, sh_mid, hip_mid, l_sh, r_sh, show_ribs: bool) -> None:
 
 def _draw_limb_pair(pen, a: np.ndarray, b: np.ndarray, gap: float) -> None:
     """Forearm (radius + ulna) and shin (tibia + fibula) are two thin parallel bones."""
+    if not pen.detailed:
+        pen.bone(_ipt(a), _ipt(b), 0.7)
+        return
     off = _perp(unit(b - a)) * gap
     pen.bone(_ipt(a + off), _ipt(b + off), 0.55)
     pen.bone(_ipt(a - off), _ipt(b - off), 0.45)
@@ -265,7 +280,8 @@ def _draw_limb_pair(pen, a: np.ndarray, b: np.ndarray, gap: float) -> None:
 def _draw_hand(pen, elbow: np.ndarray, wrist: np.ndarray) -> None:
     fwd = wrist - elbow
     length = float(np.linalg.norm(fwd)) * 0.38
-    if length < 3:
+    if not pen.detailed or length < 3:
+        pen.knob(_ipt(wrist), 0.8)
         return
     base_angle = math.atan2(fwd[1], fwd[0])
     for spread in (-0.5, -0.17, 0.17, 0.5):

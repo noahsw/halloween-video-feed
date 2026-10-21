@@ -26,7 +26,9 @@ Built for a Mac with Apple Silicon and a TP-Link Tapo camera, but any RTSP camer
    on the floor, so they look like they're in the room rather than pasted on. Bones scale with
    distance from the camera. A glowing neon tube style is also available.
 
-On an M2 Pro it keeps up with a 15 fps camera at 1080p output.
+On an M2 Pro it keeps up with a 20 fps camera at 1080p output, even with around 20 skeletons on the
+floor. Pose detection and person segmentation run on the GPU at the same time (segmentation in its
+own process), and distant dancers are drawn with less detail.
 
 ## Setup
 
@@ -78,6 +80,21 @@ uv run party-cam --list-displays
   `z`, drag a box around it, and press Enter. Zones are saved in `local/`. Press `x` to clear them.
 - Press `h` to see FPS, how many dancers are detected, and how much of the floor has been learned.
 
+### On-screen messages
+
+About every 30 seconds, a funny message fades in at the bottom of the screen for 8 seconds,
+like "TIBIA HONEST, YOU SHOULD BE DANCING". There are over 220 messages, and each list is
+shuffled, so a message typically doesn't come back for over an hour.
+
+Half the time, the message fits the moment:
+
+- **How busy the floor is.** An empty floor, one lone dancer, a few people, a crowd, or a packed floor of 20 or more.
+- **The time of night.** Early evening, the witching hour around midnight, after 1 AM, and last call.
+- **Live numbers.** "17 SKELETONS ON THE FLOOR. BE NUMBER 18." or "IT'S 11:42 PM. DO YOU KNOW WHERE YOUR BONES ARE?"
+
+Edit or add your own in [partycam/messages.py](partycam/messages.py). Use `--banner-every 45` to
+show them less often, or press `j` to turn them off.
+
 ### Recording a test clip
 
 To tune the look without a live party, record a raw clip from the camera and replay it:
@@ -108,9 +125,11 @@ it's installed (`brew install ffmpeg`), which saves the camera's stream as-is wi
 
 ### Useful flags
 
-- `--imgsz 1280`: finds smaller, farther dancers, at some cost to FPS.
-- `--pose-model yolo11m-pose.pt`: more accurate pose model, about half the speed.
+- `--imgsz 960 --seg-imgsz 640`: faster, for a small party. The defaults (1280 and 960) are tuned
+  for a packed floor, where they find and erase many more partly hidden people.
 - `--room-brightness 0.6`: darker room, so the skeletons pop more.
+- `--seg-every 1`: run person segmentation on every frame instead of every other one. Erases
+  fast movers slightly better, at the cost of a few FPS with a big crowd.
 - `--width 1280`: lighter on the CPU if you need more FPS.
 
 ## Privacy

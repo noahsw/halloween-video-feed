@@ -15,6 +15,20 @@ from typing import Optional
 import cv2
 import numpy as np
 
+GAIN_GRID = 8  # 1920x1080 divides evenly, which keeps INTER_AREA on its fast path
+
+
+def upscale_region(small: np.ndarray, grid: int, x: int, y: int, w: int, h: int) -> np.ndarray:
+    """Upscales just the (x, y, w, h) full-resolution region of a smooth map stored at 1/grid
+    scale, instead of the whole frame."""
+    sx0, sy0 = x // grid, y // grid
+    sx1, sy1 = min(small.shape[1], (x + w) // grid + 2), min(small.shape[0], (y + h) // grid + 2)
+    big = cv2.resize(small[sy0:sy1, sx0:sx1], ((sx1 - sx0) * grid, (sy1 - sy0) * grid), interpolation=cv2.INTER_LINEAR)
+    big = big[y - sy0 * grid : y - sy0 * grid + h, x - sx0 * grid : x - sx0 * grid + w]
+    if big.shape[:2] != (h, w):  # frame size isn't a multiple of the grid at the right/bottom edge
+        big = cv2.copyMakeBorder(big, 0, h - big.shape[0], 0, w - big.shape[1], cv2.BORDER_REPLICATE)
+    return big
+
 
 class InvisibilityCloak:
     def __init__(self, plate_path: Optional[Path] = None, learn_rate: float = 0.03):
@@ -22,6 +36,7 @@ class InvisibilityCloak:
         self.learn_rate = learn_rate
         self.plate: Optional[np.ndarray] = None  # float32 HxWx3
         self.known: Optional[np.ndarray] = None  # uint8 HxW, 255 where the plate has seen the empty floor
+        self.frame_count = 0
 
     @property
     def coverage(self) -> float:
@@ -49,9 +64,10 @@ class InvisibilityCloak:
         self.plate_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(self.plate_path), np.clip(self.plate, 0, 255).astype(np.uint8))
 
-    def apply(self, frame: np.ndarray, person_mask: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    def apply(self, frame: np.ndarray, person_mask: np.ndarray, alpha: np.ndarray, feather_px: int = 12) -> np.ndarray:
         """person_mask: uint8, 255 where people are (dilated). alpha: float32 feathered version
-        of it (0..1). Returns the frame with people painted over by the empty floor."""
+        of it (0..1), reaching at most feather_px beyond the mask. Returns the frame with people
+        painted over by the empty floor."""
         h, w = frame.shape[:2]
         if self.plate is None or self.plate.shape[:2] != (h, w):
             if not self.load(frame.shape):
@@ -63,15 +79,20 @@ class InvisibilityCloak:
         if cv2.countNonZero(newly_seen):
             cv2.copyTo(frame.astype(np.float32), newly_seen, self.plate)
             cv2.bitwise_or(self.known, newly_seen, self.known)
-        cv2.accumulateWeighted(frame, self.plate, self.learn_rate, mask=free)
+        # Learning every other frame at twice the rate is the same speed of adaptation, at half the cost
+        self.frame_count += 1
+        if self.frame_count % 2 == 0:
+            cv2.accumulateWeighted(frame, self.plate, min(1.0, self.learn_rate * 2), mask=free)
 
-        x, y, rw, rh = cv2.boundingRect(cv2.max(person_mask, (alpha > 0.004).astype(np.uint8)))
+        x, y, rw, rh = cv2.boundingRect(person_mask)
         if rw == 0 or rh == 0:
             return frame
+        x, y = max(0, x - feather_px), max(0, y - feather_px)
+        rw, rh = min(w - x, rw + 2 * feather_px), min(h - y, rh + 2 * feather_px)
 
-        gain = self._gain_map(frame, free)
+        gain = upscale_region(self._gain_map(frame, free), GAIN_GRID, x, y, rw, rh)
         roi = (slice(y, y + rh), slice(x, x + rw))
-        fill = cv2.convertScaleAbs(cv2.multiply(self.plate[roi], gain[roi]))
+        fill = cv2.convertScaleAbs(cv2.multiply(self.plate[roi], gain))
         hidden_unknown = cv2.bitwise_and(person_mask[roi], cv2.bitwise_not(self.known[roi]))
         if cv2.countNonZero(hidden_unknown):
             fill = self._inpaint_unknown(fill, hidden_unknown)
@@ -82,8 +103,9 @@ class InvisibilityCloak:
         return out
 
     def _gain_map(self, frame: np.ndarray, free: np.ndarray) -> np.ndarray:
+        """Per-region color gain (current light / plate's light), at 1/GAIN_GRID scale."""
         h, w = frame.shape[:2]
-        sw, sh = max(16, w // 8), max(9, h // 8)
+        sw, sh = max(1, w // GAIN_GRID), max(1, h // GAIN_GRID)
         f_s = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA).astype(np.float32)
         p_s = cv2.resize(self.plate, (sw, sh), interpolation=cv2.INTER_AREA)
         valid = cv2.bitwise_and(free, self.known)
@@ -100,7 +122,7 @@ class InvisibilityCloak:
         # Where no nearby pixels are visible, fall back to the frame-wide gain
         prior = 0.05
         gain = (num + global_gain * prior) / (den + prior)
-        return cv2.resize(gain.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+        return gain.astype(np.float32)
 
     def _inpaint_unknown(self, fill: np.ndarray, hidden_unknown: np.ndarray) -> np.ndarray:
         """Floor the plate has never seen (someone has been standing there since startup)."""
