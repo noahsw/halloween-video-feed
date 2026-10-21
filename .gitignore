@@ -1,0 +1,26 @@
+# Secrets: camera credentials live here
+.env
+.env.*
+!.env.example
+
+# Per-house state: the learned empty-floor image is a photo of your room
+local/
+
+# Downloaded model weights
+models/
+*.pt
+*.mlpackage
+*.onnx
+
+# Any recordings or snapshots
+*.mp4
+*.mov
+*.avi
+recordings/
+runs/
+
+# Python / OS
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

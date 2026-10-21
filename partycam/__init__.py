@@ -1,0 +1,1 @@
+"""Halloween skeleton party cam."""
