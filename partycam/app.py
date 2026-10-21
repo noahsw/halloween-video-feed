@@ -28,6 +28,7 @@ Live Party Hotkeys (while window is focused):
 """
 
 import argparse
+import dataclasses
 import hashlib
 import signal
 import threading
@@ -43,6 +44,7 @@ from .banner import JoinBanner
 from .cloak import InvisibilityCloak, upscale_region
 from .config import LOCAL_DIR, MODELS_DIR, load_env, redact, rtsp_url_from_env
 from .display import FullscreenController, find_screen, screen_names
+from .interp import Interpolator
 from .macos import keep_process_fast, keep_thread_fast
 from .anatomy import CONF_THRESH, L_AN, L_KN, R_AN, R_KN
 from .skeleton import PALETTE_NAMES, SkeletonCanvas, draw_dancers
@@ -57,6 +59,8 @@ BG_INVISIBLE, BG_DIM, BG_VOID, BG_SPECTRAL = 1, 2, 3, 4
 TRAIL_PRESETS = [0.80, 0.90, 0.65, 0.0]  # Medium, Long Ghost Echo, Short, Off
 TRAIL_OFF = TRAIL_PRESETS.index(0.0)
 SEG_CONF = 0.25
+# Blur (sigma, px) so bones are as soft as the camera image instead of razor sharp
+SKELETON_SOFTEN = 0.4
 
 # Limb segments painted into the person mask, on top of the segmentation mask, so
 # fast-moving arms the segmenter misses still get erased.
@@ -68,6 +72,10 @@ class Analysis:
     frame: np.ndarray
     dancers: List[Dancer]
     seg_mask: Optional[np.ndarray]  # half-resolution mask of everyone the segmentation model found
+    t: float = 0.0  # when the camera frame arrived
+    # Filled in once per camera frame by prepare_background(), then reused by every output frame
+    bg: Optional[np.ndarray] = None  # the room with people erased (or the chosen background mode)
+    motion: Optional[np.ndarray] = None  # motion edges for the ectoplasm shimmer
 
 
 class PartyCam:
@@ -127,6 +135,7 @@ class PartyCam:
         self.prev_mask: Optional[np.ndarray] = None
         self.prev_gray: Optional[np.ndarray] = None
         self.grain = 0.0  # estimated camera noise level, matched on the skeletons
+        self.last_render: Optional[float] = None
         self.dancer_count = 0
         self.timings: dict = {}
 
@@ -151,6 +160,11 @@ class PartyCam:
         return raw
 
     def detect(self, frame: np.ndarray) -> Tuple[List[Dancer], Optional[np.ndarray]]:
+        return self.detect_collect(self.detect_submit(frame))
+
+    def detect_submit(self, frame: np.ndarray) -> dict:
+        """Starts both models on the frame (they run in other processes). Returns a job for
+        detect_collect(); the caller can do CPU work in between."""
         h, w = frame.shape[:2]
         zone_boxes = self.zones.pixel_boxes(w, h)
 
@@ -183,8 +197,12 @@ class PartyCam:
                     sent.add(kind)
                 except OSError as e:
                     self._drop_proc(kind, e)
+        return dict(frame=frame, zone_boxes=zone_boxes, need_seg=need_seg, reuse=reuse, sent=sent, started=time.perf_counter())
 
-        t_pose = time.perf_counter()
+    def detect_collect(self, job: dict) -> Tuple[List[Dancer], Optional[np.ndarray]]:
+        frame, zone_boxes, need_seg, reuse, sent = (job[k] for k in ("frame", "zone_boxes", "need_seg", "reuse", "sent"))
+        h, w = frame.shape[:2]
+        t_pose = job["started"]
         poses = self._collect(POSE, sent)
         if poses is None:
             poses = detect_poses(self.pose_model, frame, self.args.imgsz, self.args.conf, self.device)
@@ -293,50 +311,69 @@ class PartyCam:
         bg[edges > 0] = (75, 30, 55)
         return cv2.add(bg, cv2.convertScaleAbs(frame, alpha=0.15))
 
-    def analyze(self, raw: np.ndarray) -> Analysis:
+    def analyze(self, raw: np.ndarray, t: Optional[float] = None) -> Analysis:
         frame = self.prepare(raw)
         t0 = time.perf_counter()
         dancers, seg_mask = self.detect(frame)
         self.timings["detect"] = time.perf_counter() - t0
-        return Analysis(frame, dancers, seg_mask)
+        return self.make_analysis(frame, dancers, seg_mask, t)
 
-    def render(self, a: Analysis, now: Optional[float] = None) -> np.ndarray:
-        now = time.time() if now is None else now
+    def make_analysis(self, frame, dancers: List[Dancer], seg_mask, t: Optional[float]) -> Analysis:
+        # Snapshot the dancers: the smoother keeps updating its own copies (e.g. fade-outs), and
+        # interpolation needs this frame's poses exactly as they were
+        dancers = [dataclasses.replace(d) for d in dancers]
+        return Analysis(frame, dancers, seg_mask, t=time.time() if t is None else t)
+
+    def prepare_background(self, a: Analysis) -> None:
+        """The expensive per-camera-frame half of rendering: erase people (and learn the floor)."""
+        if a.bg is not None:
+            return
         t0 = time.perf_counter()
-        frame, dancers = a.frame, a.dancers
-        self.dancer_count = len(dancers)
-        if self.trail is None or self.trail.shape != frame.shape:
-            self.trail = np.zeros_like(frame)
-
+        frame = a.frame
         need_gray = self.bg_mode != BG_INVISIBLE
         gray_blur = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (9, 9), 0) if need_gray else None
-        mask, alpha = self.person_mask(frame.shape, dancers, a.seg_mask)
-        bg = self.background(frame, mask, alpha, gray_blur)
-        t1 = time.perf_counter()
+        mask, alpha = self.person_mask(frame.shape, a.dancers, a.seg_mask)
+        a.bg = self.background(frame, mask, alpha, gray_blur)
+        # Ghostly ectoplasm shimmer where things move (not in invisible mode: it would outline people)
+        if gray_blur is not None and self.prev_gray is not None and self.prev_gray.shape == gray_blur.shape:
+            _, motion = cv2.threshold(cv2.absdiff(gray_blur, self.prev_gray), 22, 255, cv2.THRESH_BINARY)
+            a.motion = cv2.Canny(motion, 50, 150)
+        self.prev_gray = gray_blur
+        if PALETTE_NAMES[self.palette_idx] == "bone":
+            self.update_grain(frame)
+        self.timings["background"] = time.perf_counter() - t0
 
-        canvas = SkeletonCanvas(frame.shape)
+    def render(self, a: Analysis, now: Optional[float] = None, dancers: Optional[List[Dancer]] = None) -> np.ndarray:
+        """Draws skeletons over a's (erased) background. `dancers` are interpolated poses for this
+        moment; by default, a's own."""
+        now = time.time() if now is None else now
+        self.prepare_background(a)
+        t0 = time.perf_counter()
+        dancers = a.dancers if dancers is None else dancers
+        self.dancer_count = len(dancers)
+        if self.trail is None or self.trail.shape != a.frame.shape:
+            self.trail = np.zeros_like(a.frame)
+
+        bg = a.bg
+        canvas = SkeletonCanvas(a.frame.shape)
         palette = PALETTE_NAMES[self.palette_idx]
         draw_dancers(canvas, dancers, palette, self.show_skulls, self.show_ribs)
         if palette == "bone":
             # Neon emits its own light; bones should look like they're in the room
             bg = self.floor_shadows(bg, dancers)
-            self.update_grain(frame)
             self.light_skeletons(canvas, bg)
+        if a.motion is not None:
+            canvas.glow[a.motion > 0] = (90, 45, 15)
 
-        # Ghostly ectoplasm shimmer where things move (not in invisible mode: it would outline people)
-        if gray_blur is not None and self.prev_gray is not None and self.prev_gray.shape == gray_blur.shape:
-            _, motion = cv2.threshold(cv2.absdiff(gray_blur, self.prev_gray), 22, 255, cv2.THRESH_BINARY)
-            canvas.glow[cv2.Canny(motion, 50, 150) > 0] = (90, 45, 15)
-        self.prev_gray = gray_blur
-
-        out = self.composite(bg, canvas, palette)
+        dt = 0.05 if self.last_render is None else min(0.2, max(0.001, now - self.last_render))
+        self.last_render = now
+        out = self.composite(bg, canvas, palette, dt)
         # Everything above runs un-mirrored so the learned floor and ignore zones never depend on it
         if self.mirror:
             out = cv2.flip(out, 1)
         if self.show_banner:
             self.banner.draw(out, now, self.dancer_count)
-        t2 = time.perf_counter()
-        self.timings.update(background=t1 - t0, render=t2 - t1)
+        self.timings["render"] = time.perf_counter() - t0
         return out
 
     def floor_shadows(self, bg: np.ndarray, dancers: List[Dancer]) -> np.ndarray:
@@ -390,7 +427,7 @@ class PartyCam:
         roi = (slice(y, y + rh), slice(x, x + rw))
         # Upscale only the part of the (very smooth) light map that covers the skeletons
         light = upscale_region(light_small, G, x, y, rw, rh)
-        soft = 0.7
+        soft = SKELETON_SOFTEN
         color = cv2.multiply(cv2.GaussianBlur(canvas.color[roi], (0, 0), soft), light, scale=1.0 / 128.0)
         alpha = cv2.GaussianBlur(canvas.alpha[roi], (0, 0), soft)
         if self.grain > 0.5:
@@ -406,13 +443,14 @@ class PartyCam:
     def process(self, raw: np.ndarray, now: Optional[float] = None) -> np.ndarray:
         return self.render(self.analyze(raw), now)
 
-    def composite(self, bg: np.ndarray, canvas: SkeletonCanvas, palette: str) -> np.ndarray:
+    def composite(self, bg: np.ndarray, canvas: SkeletonCanvas, palette: str, dt: float = 0.05) -> np.ndarray:
         h, w = bg.shape[:2]
         # Cheap wide bloom: blur at quarter resolution
         small = cv2.resize(canvas.glow, (w // 4, h // 4), interpolation=cv2.INTER_AREA)
         small = cv2.GaussianBlur(small, (0, 0), 2.5)
         glow_gain = 0.55 if palette == "bone" else 1.35
-        decay = TRAIL_PRESETS[self.trail_idx]
+        # Presets are per 50 ms (one camera frame); scale so trails last as long at any output rate
+        decay = TRAIL_PRESETS[self.trail_idx] ** (dt / 0.05)
 
         if decay > 0:
             bloom = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -446,7 +484,10 @@ class PartyCam:
 
 
 class DetectionWorker(threading.Thread):
-    """Runs pose + segmentation on the newest camera frame while the main thread renders."""
+    """Runs detection and people-erasing off the main thread, pipelined: while the model
+    processes work on camera frame N+1 on the GPU, this thread erases people from frame N on
+    the CPU, then publishes it. The main thread only draws skeletons. Costs one frame (~50 ms)
+    of extra delay, which AirPlay's 1-2 s lag hides."""
 
     def __init__(self, cam: PartyCam, stream: LowLatencyStreamReader):
         super().__init__(daemon=True)
@@ -457,24 +498,35 @@ class DetectionWorker(threading.Thread):
         self.latest: Optional[Analysis] = None
         self.seq = 0
 
+    def _publish(self, a: Analysis) -> None:
+        with self.lock:
+            self.latest = a
+            self.seq += 1
+
     def run(self) -> None:
         keep_thread_fast()
         last_id = -1
+        ready: Optional[Analysis] = None  # analyzed, people not erased yet
         while self.running:
-            frame_id, raw = self.stream.read()
+            frame_id, raw, arrived = self.stream.read_timed()
             if raw is None or frame_id == last_id:
                 time.sleep(0.002)
                 continue
             last_id = frame_id
             try:
-                result = self.cam.analyze(raw)
+                frame = self.cam.prepare(raw)
+                t0 = time.perf_counter()
+                job = self.cam.detect_submit(frame)  # GPU starts on this frame...
+                if ready is not None:  # ...while the CPU erases people from the previous one
+                    self.cam.prepare_background(ready)
+                    self._publish(ready)
+                dancers, seg_mask = self.cam.detect_collect(job)
+                self.cam.timings["detect"] = time.perf_counter() - t0
+                ready = self.cam.make_analysis(frame, dancers, seg_mask, arrived)
             except Exception:
                 traceback.print_exc()
+                ready = None
                 time.sleep(0.5)
-                continue
-            with self.lock:
-                self.latest = result
-                self.seq += 1
 
     def get(self) -> Tuple[int, Optional[Analysis]]:
         with self.lock:
@@ -499,6 +551,7 @@ class PerfLog:
         self.show: List[float] = []
         self.pose: List[float] = []
         self.seg_wait: List[float] = []
+        self.erase: List[float] = []
         self.last_shown: Optional[float] = None
         self.gaps: List[float] = []
         self.detect: List[float] = []
@@ -516,7 +569,8 @@ class PerfLog:
         self.pose.append(t.get("pose", 0.0))
         if t.get("seg_wait", 0.0) > 0:
             self.seg_wait.append(t["seg_wait"])
-        self.render.append(t.get("background", 0.0) + t.get("render", 0.0))
+        self.render.append(t.get("render", 0.0))
+        self.erase.append(t.get("background", 0.0))
         self.dancers.append(cam.dancer_count)
         elapsed = now - self.start
         if elapsed < self.every or not self.gaps:
@@ -527,13 +581,14 @@ class PerfLog:
             f"[perf] camera {(frame_id - self.start_id) / elapsed:4.1f} fps -> analyzed {(seq - self.start_seq) / elapsed:4.1f}"
             f" -> shown {len(self.gaps) / elapsed:4.1f} fps | gaps {np.median(gaps):3.0f}/{np.percentile(gaps, 95):3.0f} ms"
             f" | detect {np.mean(self.detect) * 1000:3.0f} (pose {np.mean(self.pose) * 1000:3.0f},"
-            f" seg wait {np.mean(self.seg_wait or [0]) * 1000:3.0f}), draw {np.mean(self.render) * 1000:3.0f},"
+            f" seg wait {np.mean(self.seg_wait or [0]) * 1000:3.0f}), erase {np.mean(self.erase) * 1000:3.0f},"
+            f" draw {np.mean(self.render) * 1000:3.0f},"
             f" show {np.mean(self.show) * 1000:3.0f}/{np.max(self.show) * 1000:3.0f} ms | skeletons {max(self.dancers)}",
             flush=True,
         )
         self.start, self.start_id, self.start_seq = now, frame_id, seq
         self.gaps, self.detect, self.render, self.dancers, self.show = [], [], [], [], []
-        self.pose, self.seg_wait = [], []
+        self.pose, self.seg_wait, self.erase = [], [], []
 
 
 def draw_hud(img: np.ndarray, cam: PartyCam, fps: float) -> None:
@@ -566,6 +621,8 @@ def parse_args() -> argparse.Namespace:
                    help="Let the GPU idle between frames: saves power on battery, but macOS then slows it ~30%%")  # fmt: skip
     p.add_argument("--width", type=int, default=1920, help="Processing/output width (camera frames are downscaled to this)")
     p.add_argument("--room-brightness", type=float, default=0.85, help="Room brightness in invisible mode (0-1)")
+    p.add_argument("--fps", type=float, default=30.0,
+                   help="Output frame rate; skeleton poses are interpolated between camera frames (0 = camera rate)")  # fmt: skip
     p.add_argument("--display", help="Start fullscreen on this display (index or name substring, e.g. 'TV')")
     p.add_argument("--list-displays", action="store_true", help="List displays and exit")
     p.add_argument("--mirror", action="store_true", help="Start mirrored")
@@ -616,6 +673,11 @@ def main() -> None:
     fps, frames, fps_t = 0.0, 0, time.time()
     analysis: Optional[Analysis] = None
     stats = PerfLog(stream, worker)
+    # Output frames are drawn on their own clock (--fps), interpolating poses between camera frames
+    interp = Interpolator()
+    frame_dt = 1.0 / args.fps if args.fps > 0 else 0.0
+    next_out = time.time()
+    new_analysis = False
 
     # Quit cleanly (saving the learned floor) on `kill` too, not just on 'q'
     stop_requested = threading.Event()
@@ -624,10 +686,24 @@ def main() -> None:
     print("[*] Party Cam is LIVE! Press 'h' for help, 'f' for fullscreen, 'q' to quit.", flush=True)
     try:
         while not stop_requested.is_set():
-            seq, analysis = worker.get()
-            if analysis is not None and seq != last_seq:
+            seq, latest = worker.get()
+            if latest is not None and seq != last_seq:
                 last_seq = seq
-                out = cam.render(analysis)
+                analysis = latest
+                interp.push(analysis, time.time())  # people already erased by the worker
+                new_analysis = True
+
+            now = time.time()
+            due = new_analysis if frame_dt == 0 else (interp.cur is not None and now >= next_out)
+            if due:
+                new_analysis = False
+                if frame_dt:
+                    # Don't build up a backlog if drawing falls behind (e.g. a huge crowd)
+                    next_out = max(next_out + frame_dt, now - frame_dt)
+                    bg_analysis, dancers = interp.pose_at(now)
+                else:
+                    bg_analysis, dancers = analysis, analysis.dancers
+                out = cam.render(bg_analysis, now, dancers)
                 frames += 1
                 if time.time() - fps_t >= 2.0:
                     fps, frames, fps_t = frames / (time.time() - fps_t), 0, time.time()

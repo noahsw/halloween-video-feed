@@ -20,6 +20,7 @@ dependencies = [
 [project.scripts]
 party-cam = "partycam.app:main"
 party-cam-record = "partycam.record:main"
+party-night = "partycam.launcher:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -48,6 +48,10 @@ PALETTE_NAMES = list(PALETTES)
 # on the TV, so they're skipped. That keeps a packed dance floor cheap to draw.
 DETAIL_MIN_T = 5.0
 
+# Dark edge around each bone, as a fraction of bone thickness (0 = none). It separates bones
+# from bright backgrounds, but too thick reads as a fuzzy halo once softened and AirPlayed.
+BONE_OUTLINE = 0.15
+
 
 class SkeletonCanvas:
     def __init__(self, shape: Tuple[int, ...]):
@@ -81,7 +85,7 @@ class BonePen:
         self.opacity = opacity
         self.t = t
         self.detailed = t >= DETAIL_MIN_T
-        self.outline = max(1, int(round(t * 0.35)))
+        self.outline = int(round(t * BONE_OUTLINE))
 
     def _opaque(self, draw, color, thickness: int) -> None:
         draw(self.c.color, color, thickness)
@@ -111,8 +115,9 @@ class BonePen:
         pts = pts.astype(np.int32).reshape((-1, 1, 2))
         cv2.fillPoly(self.c.color, [pts], self.ivory, cv2.LINE_AA)
         cv2.fillPoly(self.c.alpha, [pts], self.a, cv2.LINE_AA)
-        cv2.polylines(self.c.color, [pts], True, self.shadow, self.outline * 2, cv2.LINE_AA)
-        cv2.polylines(self.c.alpha, [pts], True, self.a, self.outline * 2, cv2.LINE_AA)
+        if self.outline > 0:
+            cv2.polylines(self.c.color, [pts], True, self.shadow, self.outline * 2, cv2.LINE_AA)
+            cv2.polylines(self.c.alpha, [pts], True, self.a, self.outline * 2, cv2.LINE_AA)
 
     def hole(self, pts: np.ndarray) -> None:
         """Dark cavity (eye sockets, nose)."""

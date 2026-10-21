@@ -26,12 +26,17 @@ Built for a Mac with Apple Silicon and a TP-Link Tapo camera, but any RTSP camer
    on the floor, so they look like they're in the room rather than pasted on. Bones scale with
    distance from the camera. A glowing neon tube style is also available.
 
-On an M2 Pro it keeps up with a 20 fps camera at 1080p output, even with around 20 skeletons on the
-floor. Pose detection and person segmentation each run in their own process, on the GPU at the
-same time, and distant dancers are drawn with less detail. Between camera frames, the app keeps
-the GPU lightly busy, because macOS otherwise lowers the GPU clock and every frame gets about 30%
-slower. Each 10 seconds it prints a `[perf]` line to the terminal (camera, analyzed and shown fps,
-plus timings) so you can check how it's doing.
+5. **30 fps output from a 20 fps camera.** With people erased, the room barely changes between
+   frames, so the app draws in-between poses for each skeleton, blending its last two detected
+   poses. The picture runs about 0.1 s behind the camera, which AirPlay's own 1-2 s lag hides.
+
+On an M2 Pro it shows a steady 30 fps with a handful of dancers. With 20 or more skeletons on
+screen it draws about 18 fps, still evenly paced. Pose detection and person segmentation each
+run in their own process on the GPU at the same time. People are erased on a background thread
+while the GPU works on the next frame, and distant dancers are drawn with less detail. Between
+camera frames the app keeps the GPU lightly busy, because macOS otherwise lowers the GPU clock
+and every frame gets about 30% slower. Every 10 seconds it prints a `[perf]` line to the
+terminal (camera, analyzed and shown fps, plus timings) so you can check how it's doing.
 
 ## Setup
 
@@ -65,14 +70,19 @@ uv run party-cam --list-displays
 1. On the Mac: Control Center → **Screen Mirroring** → pick your TV (Apple TV or an AirPlay 2 TV).
 2. In the same menu (or System Settings → Displays), choose **Use As Separate Display**, so the TV
    shows only the party cam while you keep using your laptop screen.
-3. Start fullscreen on the TV, matching it by name:
+3. Start it fullscreen on the TV, matching the TV by name:
 
    ```bash
-   caffeinate -dis uv run party-cam --display "Living Room"
+   uv run party-night --display "Living Room"
    ```
 
-   `caffeinate` keeps the Mac from sleeping mid-party. You can also press `d` to move the
-   fullscreen window to the next display.
+   `party-night` is the launcher for the actual party:
+   - It runs `party-cam` (any options are passed through) and keeps the Mac awake.
+   - If the app crashes, or freezes for 45 seconds, it restarts it, fullscreen on the TV again.
+   - Quitting with `q` or Ctrl-C stops it for good.
+   - Everything is logged to `local/logs/` so you can check the morning after.
+
+   You can also press `d` in the app to move the fullscreen window to the next display.
 
 ### Before guests arrive
 
@@ -131,6 +141,7 @@ it's installed (`brew install ffmpeg`), which saves the camera's stream as-is wi
 - `--imgsz 960 --seg-imgsz 640`: faster, for a small party. The defaults (1280 and 960) are tuned
   for a packed floor, where they find and erase many more partly hidden people.
 - `--room-brightness 0.6`: darker room, so the skeletons pop more.
+- `--fps 0`: draw only on new camera frames, with no in-between poses.
 - `--seg-every 1`: run person segmentation on every frame instead of every other one. Erases
   fast movers slightly better, at the cost of a few FPS with a big crowd.
 - `--width 1280`: lighter on the CPU if you need more FPS.

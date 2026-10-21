@@ -27,6 +27,7 @@ class LowLatencyStreamReader:
         self.cap: Optional[cv2.VideoCapture] = None
         self.frame: Optional[np.ndarray] = None
         self.frame_id = 0
+        self.frame_time = 0.0  # when the latest frame arrived
         self.running = True
         self.lock = threading.Lock()
         self._connect()
@@ -69,6 +70,7 @@ class LowLatencyStreamReader:
                 with self.lock:
                     self.frame = img
                     self.frame_id += 1
+                    self.frame_time = time.time()
             elif is_file:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             else:
@@ -80,6 +82,11 @@ class LowLatencyStreamReader:
                     self._connect()
                 else:
                     time.sleep(0.01)
+
+    def read_timed(self) -> Tuple[int, Optional[np.ndarray], float]:
+        """Like read(), plus when the frame arrived."""
+        with self.lock:
+            return self.frame_id, self.frame, self.frame_time
 
     def read(self) -> Tuple[int, Optional[np.ndarray]]:
         """Returns (frame_id, frame). frame_id only increases when a new frame arrives."""
