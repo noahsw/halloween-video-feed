@@ -97,7 +97,7 @@ it's installed (`brew install ffmpeg`), which saves the camera's stream as-is wi
 | `1` `2` `3` `4` | Background: invisible dancers / dimmed room / black void / spectral edges |
 | `c` | Skeleton style: bone, multi-color neon, ecto green, phantom, inferno |
 | `s` / `r` | Toggle skulls / ribcages |
-| `t` | Phantom trail length (medium → long → short → off) |
+| `t` | Phantom trail length for the current style (medium → long → short → off). Off by default for bone, medium for neon |
 | `j` | Toggle the "join the dance floor" banner |
 | `b` | Re-learn the empty floor |
 | `z` / `x` | Add an ignore zone / clear zones |

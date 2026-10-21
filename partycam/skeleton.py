@@ -14,7 +14,8 @@ from typing import List, Sequence, Tuple
 import cv2
 import numpy as np
 
-from .anatomy import L_AN, L_EL, L_HIP, L_KN, L_SH, L_WR, R_AN, R_EL, R_HIP, R_KN, R_SH, R_WR, estimate_head, unit
+from .anatomy import L_AN, L_EL, L_HIP, L_KN, L_SH, L_WR, R_AN, R_EL, R_HIP, R_KN, R_SH, R_WR, MIN_WIDTH_TO_TORSO
+from .anatomy import estimate_head, unit
 from .anatomy import kpt as _pt
 from .tracking import Dancer
 
@@ -217,7 +218,7 @@ def _draw_ribcage(pen, sh_mid, hip_mid, l_sh, r_sh, show_ribs: bool) -> None:
         return
     u_spine = spine_vec / torso_len
     u_perp = _perp(u_spine)
-    sh_w = float(np.linalg.norm(l_sh - r_sh))
+    sh_w = max(float(np.linalg.norm(l_sh - r_sh)), MIN_WIDTH_TO_TORSO * torso_len)
 
     # Vertebrae
     n_vert = 9

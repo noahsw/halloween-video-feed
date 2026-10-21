@@ -16,7 +16,7 @@ Live Party Hotkeys (while window is focused):
     1 / 2 / 3 / 4 : Background (1 = Invisible dancers, 2 = Dimmed Room, 3 = Pitch-Black Void, 4 = Spectral Night-Vision)
     s         : Toggle Skull Heads on/off
     r         : Toggle Ribcage on/off
-    t         : Cycle Phantom Trail persistence (Medium -> Long Ghost Echo -> Short -> Off)
+    t         : Cycle Phantom Trail persistence (Medium -> Long Ghost Echo -> Short -> Off); off by default for bone style
     c         : Cycle Skeleton Style (Bone, Multi-Dancer Neon, Ecto-Green, Phantom Cyan/Purple, Hellfire Orange)
     j         : Toggle "Join the dance floor" banner
     b         : Re-learn the empty dance floor (use if the camera got bumped)
@@ -53,6 +53,7 @@ WINDOW_NAME = "Halloween Skeleton Party Cam"
 
 BG_INVISIBLE, BG_DIM, BG_VOID, BG_SPECTRAL = 1, 2, 3, 4
 TRAIL_PRESETS = [0.80, 0.90, 0.65, 0.0]  # Medium, Long Ghost Echo, Short, Off
+TRAIL_OFF = TRAIL_PRESETS.index(0.0)
 
 # Limb segments painted into the person mask, on top of the segmentation mask, so
 # fast-moving arms the segmenter misses still get erased.
@@ -97,7 +98,9 @@ class PartyCam:
         self.show_banner = not args.no_banner
         self.mirror = args.mirror
         self.palette_idx = 0
-        self.trail_idx = 0
+        # Each style remembers its own trail setting. Glowing neon suits ghost trails; on lit bones
+        # they read as double vision, so bone starts with them off.
+        self.trail_by_style = {name: TRAIL_OFF if name == "bone" else 0 for name in PALETTE_NAMES}
 
         self.trail: Optional[np.ndarray] = None
         self.prev_mask: Optional[np.ndarray] = None
@@ -105,6 +108,14 @@ class PartyCam:
         self.grain = 0.0  # estimated camera noise level, matched on the skeletons
         self.dancer_count = 0
         self.timings: dict = {}
+
+    @property
+    def trail_idx(self) -> int:
+        return self.trail_by_style[PALETTE_NAMES[self.palette_idx]]
+
+    @trail_idx.setter
+    def trail_idx(self, idx: int) -> None:
+        self.trail_by_style[PALETTE_NAMES[self.palette_idx]] = idx
 
     def reset_buffers(self) -> None:
         self.trail = None
