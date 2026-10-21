@@ -112,7 +112,8 @@ class PartyCam:
     def prepare(self, raw: np.ndarray) -> np.ndarray:
         h, w = raw.shape[:2]
         if w > self.args.width:
-            raw = cv2.resize(raw, (self.args.width, int(h * self.args.width / w)), interpolation=cv2.INTER_AREA)
+            # INTER_AREA is ~20x slower here (non-integer 2560->1920) for no visible gain
+            raw = cv2.resize(raw, (self.args.width, int(h * self.args.width / w)), interpolation=cv2.INTER_LINEAR)
         return raw
 
     def detect(self, frame: np.ndarray) -> Tuple[List[Dancer], list]:
