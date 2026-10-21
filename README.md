@@ -27,8 +27,11 @@ Built for a Mac with Apple Silicon and a TP-Link Tapo camera, but any RTSP camer
    distance from the camera. A glowing neon tube style is also available.
 
 On an M2 Pro it keeps up with a 20 fps camera at 1080p output, even with around 20 skeletons on the
-floor. Pose detection and person segmentation run on the GPU at the same time (segmentation in its
-own process), and distant dancers are drawn with less detail.
+floor. Pose detection and person segmentation each run in their own process, on the GPU at the
+same time, and distant dancers are drawn with less detail. Between camera frames, the app keeps
+the GPU lightly busy, because macOS otherwise lowers the GPU clock and every frame gets about 30%
+slower. Each 10 seconds it prints a `[perf]` line to the terminal (camera, analyzed and shown fps,
+plus timings) so you can check how it's doing.
 
 ## Setup
 
@@ -131,6 +134,8 @@ it's installed (`brew install ffmpeg`), which saves the camera's stream as-is wi
 - `--seg-every 1`: run person segmentation on every frame instead of every other one. Erases
   fast movers slightly better, at the cost of a few FPS with a big crowd.
 - `--width 1280`: lighter on the CPU if you need more FPS.
+- `--no-gpu-warm`: let the GPU idle between frames. Saves power on battery, but frames get
+  slower after about a minute. Keep the Mac plugged in for the party instead.
 
 ## Privacy
 

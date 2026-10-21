@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from .config import redact
+from .macos import keep_thread_fast
 
 # Force low-latency TCP transport options for OpenCV's FFmpeg RTSP backend
 os.environ.setdefault(
@@ -47,6 +48,7 @@ class LowLatencyStreamReader:
             print(f"[!] Could not open {redact(self.source)}; retrying...")
 
     def _update_loop(self) -> None:
+        keep_thread_fast()
         consecutive_failures = 0
         # Video files (handy for testing) play back at their own frame rate and loop
         is_file = os.path.isfile(str(self.source))

@@ -9,6 +9,7 @@ out. So before filling, the plate is relit with a smooth per-region color gain t
 measured on the visible (non-person) parts of the current frame.
 """
 
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -58,11 +59,21 @@ class InvisibilityCloak:
         self.known = np.full(shape[:2], 255, np.uint8)
         return True
 
-    def save(self) -> None:
+    def save(self, background: bool = False) -> None:
+        """With background=True the PNG is written on another thread, so the periodic save
+        doesn't stall a frame (encoding a 1080p PNG takes ~100 ms)."""
         if self.plate_path is None or self.plate is None or self.coverage < 0.97:
             return
-        self.plate_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(self.plate_path), np.clip(self.plate, 0, 255).astype(np.uint8))
+        img, path = cv2.convertScaleAbs(self.plate), self.plate_path
+
+        def write() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(path), img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+
+        if background:
+            threading.Thread(target=write, daemon=True).start()
+        else:
+            write()
 
     def apply(self, frame: np.ndarray, person_mask: np.ndarray, alpha: np.ndarray, feather_px: int = 12) -> np.ndarray:
         """person_mask: uint8, 255 where people are (dilated). alpha: float32 feathered version

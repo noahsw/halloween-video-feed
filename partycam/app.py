@@ -43,9 +43,10 @@ from .banner import JoinBanner
 from .cloak import InvisibilityCloak, upscale_region
 from .config import LOCAL_DIR, MODELS_DIR, load_env, redact, rtsp_url_from_env
 from .display import FullscreenController, find_screen, screen_names
+from .macos import keep_process_fast, keep_thread_fast
 from .anatomy import CONF_THRESH, L_AN, L_KN, R_AN, R_KN
 from .skeleton import PALETTE_NAMES, SkeletonCanvas, draw_dancers
-from .segproc import SegmentationProcess, half_shape, segment_people
+from .modelprocs import POSE, SEGMENT, ModelProcess, SharedFrame, detect_poses, half_shape, segment_people
 from .stream import LowLatencyStreamReader
 from .tracking import Dancer, PoseSmoother
 from .zones import IgnoreZones
@@ -82,15 +83,26 @@ class PartyCam:
         self.args = args
         self.device = device
         print(f"[*] Loading models on device='{device}'...")
+        # Loaded here too: this downloads missing weights, and they're the fallback if a process fails
         self.pose_model = YOLO(str(MODELS_DIR / args.pose_model))
-        self.seg_model = YOLO(str(MODELS_DIR / args.seg_model))  # also the fallback if the process fails
-        self.segproc: Optional[SegmentationProcess] = None
+        self.seg_model = YOLO(str(MODELS_DIR / args.seg_model))
         self.seg_frame = 0
         self.last_seg_mask: Optional[np.ndarray] = None
-        try:
-            self.segproc = SegmentationProcess(str(MODELS_DIR / args.seg_model), args.seg_imgsz, SEG_CONF, device)
-        except Exception as e:
-            print(f"[!] Couldn't start the segmentation process ({e}); running it in-thread (slower)")
+        # Both models run in their own processes, at the same time (see modelprocs.py)
+        self.frame_buf: Optional[SharedFrame] = SharedFrame()
+        self.procs: dict = {}
+        for kind, weights, imgsz, conf in [(POSE, args.pose_model, args.imgsz, args.conf),
+                                           (SEGMENT, args.seg_model, args.seg_imgsz, SEG_CONF)]:  # fmt: skip
+            try:
+                warm = kind == POSE and not args.no_gpu_warm  # one process keeping the GPU busy is enough
+                self.procs[kind] = ModelProcess(kind, str(MODELS_DIR / weights), imgsz, conf, device, self.frame_buf, warm)
+            except Exception as e:
+                print(f"[!] Couldn't start the {kind} process ({e}); running it in-thread (slower)")
+        for kind, proc in list(self.procs.items()):
+            try:
+                proc.wait_ready()
+            except Exception as e:
+                self._drop_proc(kind, e)
 
         self.smoother = PoseSmoother()
         # One saved floor image per video source, so a webcam test never pollutes the party camera's
@@ -142,10 +154,10 @@ class PartyCam:
         h, w = frame.shape[:2]
         zone_boxes = self.zones.pixel_boxes(w, h)
 
-        # Segmentation runs in its own process at the same time as pose, below. The GPU is
-        # saturated running both models every frame, so with --seg-every 2 it runs every other
-        # frame and the mask in between is reused (person_mask also holds the previous frame's
-        # mask and paints everyone's current limbs on top, so a 50 ms-old outline still covers).
+        # The GPU is saturated running both models every frame, so with --seg-every 2
+        # segmentation runs every other frame and the mask in between is reused (person_mask
+        # also holds the previous frame's mask and paints everyone's current limbs on top, so a
+        # 50 ms-old outline still covers).
         need_seg = self.bg_mode == BG_INVISIBLE or self.cloak.coverage < 0.97
         self.seg_frame += 1
         reuse = (
@@ -155,56 +167,82 @@ class PartyCam:
         )
         if need_seg and reuse:
             need_seg = False
-        submitted = False
-        if need_seg and self.segproc is not None:
-            try:
-                self.segproc.submit(frame, zone_boxes)
-                submitted = True
-            except (OSError, ValueError) as e:
-                self._drop_segproc(e)
 
-        r = self.pose_model.track(
-            frame, persist=True, imgsz=self.args.imgsz, conf=self.args.conf,
-            device=self.device, verbose=False, tracker="bytetrack.yaml",
-        )[0]  # fmt: skip
-        dancers: List[Dancer] = []
-        if r.keypoints is not None and r.boxes is not None and len(r.boxes):
-            kpts = r.keypoints.data.cpu().numpy()
-            boxes = r.boxes.xyxy.cpu().numpy()
-            ids = r.boxes.id.int().cpu().tolist() if r.boxes.id is not None else [None] * len(boxes)
-            for k, b, tid in zip(kpts, boxes, ids):
-                if not self.zones.should_ignore(b, zone_boxes):
-                    dancers.append(Dancer(kpts=k, box=b, track_id=tid))
+        # Hand the frame to both model processes; they run at the same time
+        sent = set()
+        if self.procs and self.frame_buf is not None:
+            try:
+                self.frame_buf.write(frame)
+            except ValueError as e:
+                for kind in list(self.procs):
+                    self._drop_proc(kind, e)
+        for kind in (POSE, SEGMENT) if need_seg else (POSE,):
+            if kind in self.procs:
+                try:
+                    self.procs[kind].submit(zone_boxes)
+                    sent.add(kind)
+                except OSError as e:
+                    self._drop_proc(kind, e)
+
+        t_pose = time.perf_counter()
+        poses = self._collect(POSE, sent)
+        if poses is None:
+            poses = detect_poses(self.pose_model, frame, self.args.imgsz, self.args.conf, self.device)
+        dancers = [
+            Dancer(kpts=k, box=b, track_id=None if tid < 0 else int(tid))
+            for k, b, tid in zip(*poses)
+            if not self.zones.should_ignore(b, zone_boxes)
+        ]
         dancers = self.smoother.update(dancers)
+        t_seg = time.perf_counter()
+        self.timings["pose"] = t_seg - t_pose
+        self.timings["seg_wait"] = 0.0
 
         if not need_seg:
+            self._gpu_idle()
             if not reuse:
                 return dancers, None
             # Widen the reused outline a little to cover a frame's worth of movement
             grow = max(3, h // 120) | 1
             return dancers, cv2.dilate(self.last_seg_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow, grow)))
-        seg_mask = None
-        if submitted:
-            try:
-                seg_mask = self.segproc.result()
-            except (RuntimeError, OSError, EOFError) as e:
-                self._drop_segproc(e)
+        seg_mask = self._collect(SEGMENT, sent)
+        self._gpu_idle()
+        self.timings["seg_wait"] = time.perf_counter() - t_seg
         if seg_mask is None:
             seg_mask = np.zeros(half_shape(h, w), np.uint8)
             segment_people(self.seg_model, frame, self.args.seg_imgsz, SEG_CONF, self.device, zone_boxes, seg_mask)
         self.last_seg_mask = seg_mask
         return dancers, seg_mask
 
-    def _drop_segproc(self, error: Exception) -> None:
-        print(f"[!] Segmentation process failed ({error}); running it in-thread from now on (slower)")
-        if self.segproc is not None:
-            self.segproc.close()
-        self.segproc = None
+    def _gpu_idle(self) -> None:
+        if POSE in self.procs and not self.args.no_gpu_warm:
+            try:
+                self.procs[POSE].idle()
+            except OSError as e:
+                self._drop_proc(POSE, e)
+
+    def _collect(self, kind: str, sent: set):
+        if kind not in sent:
+            return None
+        try:
+            return self.procs[kind].result()
+        except (RuntimeError, OSError, EOFError) as e:
+            self._drop_proc(kind, e)
+            return None
+
+    def _drop_proc(self, kind: str, error: Exception) -> None:
+        print(f"[!] The {kind} process failed ({error}); running it in-thread from now on (slower)")
+        proc = self.procs.pop(kind, None)
+        if proc is not None:
+            proc.close()
 
     def close(self) -> None:
-        if self.segproc is not None:
-            self.segproc.close()
-            self.segproc = None
+        for proc in self.procs.values():
+            proc.close()
+        self.procs = {}
+        if self.frame_buf is not None:
+            self.frame_buf.close()
+            self.frame_buf = None
 
     def person_mask(self, shape, dancers: List[Dancer], seg_mask: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
         """Returns (binary mask, feathered float alpha) covering everyone, at full resolution.
@@ -420,6 +458,7 @@ class DetectionWorker(threading.Thread):
         self.seq = 0
 
     def run(self) -> None:
+        keep_thread_fast()
         last_id = -1
         while self.running:
             frame_id, raw = self.stream.read()
@@ -444,6 +483,57 @@ class DetectionWorker(threading.Thread):
     def stop(self) -> None:
         self.running = False
         self.join(timeout=2.0)
+
+
+class PerfLog:
+    """Prints one line every 10 s so problems are diagnosable from the terminal, e.g.
+    [perf] camera 20.0 fps -> shown 19.6 fps | frame gaps 50/58 ms (median/p95) | ..."""
+
+    def __init__(self, stream: LowLatencyStreamReader, worker: "DetectionWorker", every: float = 10.0):
+        self.stream = stream
+        self.worker = worker
+        self.every = every
+        self.start = time.time()
+        self.start_id = stream.read()[0]
+        self.start_seq = worker.get()[0]
+        self.show: List[float] = []
+        self.pose: List[float] = []
+        self.seg_wait: List[float] = []
+        self.last_shown: Optional[float] = None
+        self.gaps: List[float] = []
+        self.detect: List[float] = []
+        self.render: List[float] = []
+        self.dancers: List[int] = []
+
+    def frame_shown(self, cam: PartyCam, show_time: float) -> None:
+        self.show.append(show_time)
+        now = time.time()
+        if self.last_shown is not None:
+            self.gaps.append(now - self.last_shown)
+        self.last_shown = now
+        t = cam.timings
+        self.detect.append(t.get("detect", 0.0))
+        self.pose.append(t.get("pose", 0.0))
+        if t.get("seg_wait", 0.0) > 0:
+            self.seg_wait.append(t["seg_wait"])
+        self.render.append(t.get("background", 0.0) + t.get("render", 0.0))
+        self.dancers.append(cam.dancer_count)
+        elapsed = now - self.start
+        if elapsed < self.every or not self.gaps:
+            return
+        frame_id, seq = self.stream.read()[0], self.worker.get()[0]
+        gaps = np.array(self.gaps) * 1000
+        print(
+            f"[perf] camera {(frame_id - self.start_id) / elapsed:4.1f} fps -> analyzed {(seq - self.start_seq) / elapsed:4.1f}"
+            f" -> shown {len(self.gaps) / elapsed:4.1f} fps | gaps {np.median(gaps):3.0f}/{np.percentile(gaps, 95):3.0f} ms"
+            f" | detect {np.mean(self.detect) * 1000:3.0f} (pose {np.mean(self.pose) * 1000:3.0f},"
+            f" seg wait {np.mean(self.seg_wait or [0]) * 1000:3.0f}), draw {np.mean(self.render) * 1000:3.0f},"
+            f" show {np.mean(self.show) * 1000:3.0f}/{np.max(self.show) * 1000:3.0f} ms | skeletons {max(self.dancers)}",
+            flush=True,
+        )
+        self.start, self.start_id, self.start_seq = now, frame_id, seq
+        self.gaps, self.detect, self.render, self.dancers, self.show = [], [], [], [], []
+        self.pose, self.seg_wait = [], []
 
 
 def draw_hud(img: np.ndarray, cam: PartyCam, fps: float) -> None:
@@ -472,6 +562,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seg-imgsz", type=int, default=960, help="Segmentation inference size; bigger erases more of a packed crowd")
     p.add_argument("--conf", type=float, default=0.25, help="Person detection confidence threshold")
     p.add_argument("--seg-every", type=int, default=2, help="Run person segmentation every N frames (1 = every frame, slower)")
+    p.add_argument("--no-gpu-warm", action="store_true",
+                   help="Let the GPU idle between frames: saves power on battery, but macOS then slows it ~30%%")  # fmt: skip
     p.add_argument("--width", type=int, default=1920, help="Processing/output width (camera frames are downscaled to this)")
     p.add_argument("--room-brightness", type=float, default=0.85, help="Room brightness in invisible mode (0-1)")
     p.add_argument("--display", help="Start fullscreen on this display (index or name substring, e.g. 'TV')")
@@ -499,6 +591,7 @@ def main() -> None:
     import torch
 
     device = "mps" if torch.backends.mps.is_available() else ("0" if torch.cuda.is_available() else "cpu")
+    keep_process_fast()
     MODELS_DIR.mkdir(exist_ok=True)
     cam = PartyCam(args, device, source)
 
@@ -522,6 +615,7 @@ def main() -> None:
     last_save = time.time()
     fps, frames, fps_t = 0.0, 0, time.time()
     analysis: Optional[Analysis] = None
+    stats = PerfLog(stream, worker)
 
     # Quit cleanly (saving the learned floor) on `kill` too, not just on 'q'
     stop_requested = threading.Event()
@@ -541,13 +635,15 @@ def main() -> None:
                 if show_hud:
                     display = out.copy()
                     draw_hud(display, cam, fps)
+                t_show = time.perf_counter()
                 cv2.imshow(WINDOW_NAME, display)
+                stats.frame_shown(cam, time.perf_counter() - t_show)
                 if pending_display is not None:
                     fullscreen.enter(pending_display)
                     pending_display = None
 
             if time.time() - last_save > 60:
-                cam.cloak.save()
+                cam.cloak.save(background=True)
                 last_save = time.time()
 
             key = cv2.waitKey(1) & 0xFF
@@ -591,6 +687,8 @@ def main() -> None:
                 idx = fullscreen.cycle()
                 if idx is not None:
                     print(f"[*] Fullscreen on display {idx}: {screen_names()[idx]}")
+    except KeyboardInterrupt:
+        pass  # Ctrl-C in the terminal: quit quietly, cleanup below still runs
     finally:
         worker.stop()
         cam.cloak.save()
