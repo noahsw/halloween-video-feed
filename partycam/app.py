@@ -43,9 +43,10 @@ from .banner import JoinBanner
 from .cloak import InvisibilityCloak
 from .config import LOCAL_DIR, MODELS_DIR, load_env, redact, rtsp_url_from_env
 from .display import FullscreenController, find_screen, screen_names
-from .skeleton import PALETTE_NAMES, SkeletonCanvas, draw_dancers, estimate_head
+from .anatomy import CONF_THRESH, L_AN, R_AN
+from .skeleton import PALETTE_NAMES, SkeletonCanvas, draw_dancers
 from .stream import LowLatencyStreamReader
-from .tracking import CONF_THRESH, Dancer, PoseSmoother
+from .tracking import Dancer, PoseSmoother
 from .zones import IgnoreZones
 
 WINDOW_NAME = "Halloween Skeleton Party Cam"
@@ -101,6 +102,7 @@ class PartyCam:
         self.trail: Optional[np.ndarray] = None
         self.prev_mask: Optional[np.ndarray] = None
         self.prev_gray: Optional[np.ndarray] = None
+        self.grain = 0.0  # estimated camera noise level, matched on the skeletons
         self.dancer_count = 0
         self.timings: dict = {}
 
@@ -159,9 +161,8 @@ class PartyCam:
             for a, b in MASK_LIMBS:
                 if k[a, 2] >= CONF_THRESH and k[b, 2] >= CONF_THRESH:
                     cv2.line(mask, (int(k[a, 0] / 2), int(k[a, 1] / 2)), (int(k[b, 0] / 2), int(k[b, 1] / 2)), 255, th)
-            head = estimate_head(k)
-            if head is not None:
-                c, rad, _ = head
+            if d.head is not None:
+                c, rad, _ = d.head
                 cv2.circle(mask, (int(c[0] / 2), int(c[1] / 2)), int(rad * 0.75), 255, -1)
         grow = max(3, sh // 70) | 1
         mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow, grow)))
@@ -214,6 +215,11 @@ class PartyCam:
         canvas = SkeletonCanvas(frame.shape)
         palette = PALETTE_NAMES[self.palette_idx]
         draw_dancers(canvas, dancers, palette, self.show_skulls, self.show_ribs)
+        if palette == "bone":
+            # Neon emits its own light; bones should look like they're in the room
+            bg = self.floor_shadows(bg, dancers)
+            self.update_grain(frame)
+            self.light_skeletons(canvas, bg)
 
         # Ghostly ectoplasm shimmer where things move (not in invisible mode: it would outline people)
         if gray_blur is not None and self.prev_gray is not None and self.prev_gray.shape == gray_blur.shape:
@@ -230,6 +236,71 @@ class PartyCam:
         t2 = time.perf_counter()
         self.timings.update(background=t1 - t0, render=t2 - t1)
         return out
+
+    def floor_shadows(self, bg: np.ndarray, dancers: List[Dancer]) -> np.ndarray:
+        """Soft contact shadow under each skeleton's feet, so they stand on the floor."""
+        h, w = bg.shape[:2]
+        sw, sh = w // 4, h // 4
+        shadow = np.zeros((sh, sw), np.uint8)
+        for d in dancers:
+            k = d.kpts
+            feet = [k[i, :2] for i in (L_AN, R_AN) if k[i, 2] >= CONF_THRESH]
+            base = np.mean(feet, axis=0) if feet else np.array([(d.box[0] + d.box[2]) / 2, d.box[3]])
+            spread = float(np.linalg.norm(feet[0] - feet[1])) if len(feet) == 2 else 0.0
+            half_w = max(spread * 0.6 + d.height * 0.05, d.height * 0.12)
+            center = (int(base[0] / 4), int((base[1] + d.height * 0.015) / 4))
+            axes = (max(1, int(half_w / 4)), max(1, int(half_w * 0.3 / 4)))
+            cv2.ellipse(shadow, center, axes, 0, 0, 360, int(120 * d.opacity), -1)
+        if not shadow.any():
+            return bg
+        shadow = cv2.resize(cv2.GaussianBlur(shadow, (0, 0), max(1.0, sh / 150)), (w, h), interpolation=cv2.INTER_LINEAR)
+        return cv2.multiply(bg, cv2.merge([cv2.bitwise_not(shadow)] * 3), scale=1.0 / 255.0)
+
+    def update_grain(self, frame: np.ndarray) -> None:
+        """Estimates the camera's noise from a center crop (robust median of the high-pass)."""
+        h, w = frame.shape[:2]
+        crop = cv2.cvtColor(frame[h // 2 - 160 : h // 2 + 160, w // 2 - 160 : w // 2 + 160], cv2.COLOR_BGR2GRAY)
+        highpass = cv2.absdiff(crop, cv2.GaussianBlur(crop, (3, 3), 0))
+        sigma = min(10.0, 1.85 * float(np.median(highpass)))
+        self.grain += 0.05 * (sigma - self.grain)
+
+    def light_skeletons(self, canvas: SkeletonCanvas, bg: np.ndarray) -> None:
+        """Tints and dims the bones by the light around them (purple party light makes purple
+        bones, dark corners make darker bones), then matches the camera's softness and grain."""
+        x, y, rw, rh = cv2.boundingRect(canvas.alpha)
+        if rw == 0 or rh == 0:
+            return
+        h, w = bg.shape[:2]
+        G = 8
+        # 1/8 scale: 1920x1080 divides evenly, which keeps INTER_AREA on its fast path
+        small = cv2.resize(bg, (max(1, w // G), max(1, h // G)), interpolation=cv2.INTER_AREA).astype(np.float32)
+        small = cv2.GaussianBlur(small, (0, 0), 4.0)
+        luma = small @ np.array([0.114, 0.587, 0.299], np.float32)
+        # Bones stay brighter than their surroundings so they read, but follow the room's light
+        intensity = np.clip(0.5 + luma / 120.0, 0.5, 1.1)
+        tint = np.clip(1.0 + 0.6 * ((small + 12.0) / (luma[..., None] + 12.0) - 1.0), 0.5, 1.5)
+        light_small = (tint * intensity[..., None]).astype(np.float32)
+
+        # Pad so the softening blur isn't clipped at the box edge
+        x, y = max(0, x - 3), max(0, y - 3)
+        rw, rh = min(w - x, rw + 6), min(h - y, rh + 6)
+        roi = (slice(y, y + rh), slice(x, x + rw))
+        # Upscale only the part of the (very smooth) light map that covers the skeletons
+        sx0, sy0 = x // G, y // G
+        sx1, sy1 = min(light_small.shape[1], (x + rw) // G + 2), min(light_small.shape[0], (y + rh) // G + 2)
+        light = cv2.resize(light_small[sy0:sy1, sx0:sx1], ((sx1 - sx0) * G, (sy1 - sy0) * G), interpolation=cv2.INTER_LINEAR)
+        light = light[y - sy0 * G : y - sy0 * G + rh, x - sx0 * G : x - sx0 * G + rw]
+        if light.shape[:2] != (rh, rw):  # frame size isn't a multiple of G at the right/bottom edge
+            light = cv2.copyMakeBorder(light, 0, rh - light.shape[0], 0, rw - light.shape[1], cv2.BORDER_REPLICATE)
+        soft = 0.7
+        color = cv2.GaussianBlur(canvas.color[roi], (0, 0), soft).astype(np.float32) * light
+        alpha = cv2.GaussianBlur(canvas.alpha[roi], (0, 0), soft)
+        if self.grain > 0.5:
+            noise = np.empty((rh, rw), np.float32)
+            cv2.randn(noise, 0.0, self.grain)
+            color += (noise * (alpha.astype(np.float32) / 255.0))[..., None]
+        canvas.color[roi] = np.clip(color, 0, 255).astype(np.uint8)
+        canvas.alpha[roi] = alpha
 
     def process(self, raw: np.ndarray, now: Optional[float] = None) -> np.ndarray:
         return self.render(self.analyze(raw), now)

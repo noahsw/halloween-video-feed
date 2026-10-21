@@ -1,7 +1,7 @@
 """Skeleton drawing.
 
 Two looks share the same anatomy code through a "pen":
-  * BonePen  - ivory bones with dark outlines and a faint colored aura (looks like a real skeleton)
+  * BonePen  - ivory bones with dark outlines, later lit by the room's light (looks like a real skeleton)
   * NeonPen  - the glowing neon tube look from the original script
 
 Pens draw into a SkeletonCanvas: an opaque layer (premultiplied color + alpha) that gets
@@ -9,19 +9,16 @@ alpha-composited over the background, plus an additive glow layer that gets bloo
 """
 
 import math
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import cv2
 import numpy as np
 
-from .tracking import CONF_THRESH, Dancer
+from .anatomy import L_AN, L_EL, L_HIP, L_KN, L_SH, L_WR, R_AN, R_EL, R_HIP, R_KN, R_SH, R_WR, estimate_head, unit
+from .anatomy import kpt as _pt
+from .tracking import Dancer
 
 Point = Tuple[int, int]
-
-# COCO 17-keypoint indices
-NOSE, L_EYE, R_EYE, L_EAR, R_EAR = 0, 1, 2, 3, 4
-L_SH, R_SH, L_EL, R_EL, L_WR, R_WR = 5, 6, 7, 8, 9, 10
-L_HIP, R_HIP, L_KN, R_KN, L_AN, R_AN = 11, 12, 13, 14, 15, 16
 
 # BGR colors
 BONE_IVORY = (200, 226, 238)
@@ -29,7 +26,7 @@ BONE_SHADOW = (38, 40, 46)
 HOLE_DARK = (14, 14, 18)
 
 PALETTES = {
-    # "bone" colors are only used for the aura and glowing eyes; bones stay ivory.
+    # "bone" colors are only used for the glowing eyes; bones stay ivory.
     "bone": [(80, 255, 57), (255, 60, 190), (0, 140, 255), (255, 230, 0)],
     "multi": [
         (80, 255, 57),  # Ecto Neon Green
@@ -62,74 +59,85 @@ def _ipt(p: np.ndarray | Sequence[float]) -> Point:
     return int(round(p[0])), int(round(p[1]))
 
 
+def _scale(color: Tuple[int, int, int], k: float) -> Tuple[int, int, int]:
+    return tuple(int(c * k) for c in color)  # type: ignore[return-value]
+
+
 class BonePen:
-    def __init__(self, canvas: SkeletonCanvas, aura: Tuple[int, int, int], t: float):
+    def __init__(self, canvas: SkeletonCanvas, eye_color: Tuple[int, int, int], t: float, opacity: float = 1.0):
+        # Colors are premultiplied by opacity, which is how the canvas stores them
         self.c = canvas
-        self.aura = aura
+        self.eye_color = _scale(eye_color, opacity)
+        self.ivory = _scale(BONE_IVORY, opacity)
+        self.shadow = _scale(BONE_SHADOW, opacity)
+        self.dark = _scale(HOLE_DARK, opacity)
+        self.a = int(255 * opacity)
+        self.opacity = opacity
         self.t = t
         self.outline = max(1, int(round(t * 0.35)))
 
     def _opaque(self, draw, color, thickness: int) -> None:
         draw(self.c.color, color, thickness)
-        draw(self.c.alpha, 255, thickness)
+        draw(self.c.alpha, self.a, thickness)
 
     def bone(self, p1: Point, p2: Point, scale: float = 1.0) -> None:
         th = max(1, int(round(self.t * scale)))
-        cv2.line(self.c.glow, p1, p2, self.aura, th * 4, cv2.LINE_AA)
         line = lambda img, col, w: cv2.line(img, p1, p2, col, w, cv2.LINE_AA)
-        self._opaque(line, BONE_SHADOW, th + 2 * self.outline)
-        self._opaque(line, BONE_IVORY, th)
+        self._opaque(line, self.shadow, th + 2 * self.outline)
+        self._opaque(line, self.ivory, th)
 
     def knob(self, p: Point, scale: float = 1.0) -> None:
         r = max(1, int(round(self.t * 0.75 * scale)))
         circ = lambda img, col, w: cv2.circle(img, p, w, col, -1, cv2.LINE_AA)
-        self._opaque(circ, BONE_SHADOW, r + self.outline)
-        self._opaque(circ, BONE_IVORY, r)
+        self._opaque(circ, self.shadow, r + self.outline)
+        self._opaque(circ, self.ivory, r)
 
     def curve(self, pts: np.ndarray, scale: float = 1.0, closed: bool = False) -> None:
         th = max(1, int(round(self.t * scale)))
         pts = pts.astype(np.int32).reshape((-1, 1, 2))
-        cv2.polylines(self.c.glow, [pts], closed, self.aura, th * 4, cv2.LINE_AA)
         poly = lambda img, col, w: cv2.polylines(img, [pts], closed, col, w, cv2.LINE_AA)
-        self._opaque(poly, BONE_SHADOW, th + 2 * self.outline)
-        self._opaque(poly, BONE_IVORY, th)
+        self._opaque(poly, self.shadow, th + 2 * self.outline)
+        self._opaque(poly, self.ivory, th)
 
     def solid(self, pts: np.ndarray) -> None:
         """Filled bone surface (cranium, pelvis)."""
         pts = pts.astype(np.int32).reshape((-1, 1, 2))
-        cv2.polylines(self.c.glow, [pts], True, self.aura, int(self.t * 4), cv2.LINE_AA)
-        cv2.fillPoly(self.c.color, [pts], BONE_IVORY, cv2.LINE_AA)
-        cv2.fillPoly(self.c.alpha, [pts], 255, cv2.LINE_AA)
-        cv2.polylines(self.c.color, [pts], True, BONE_SHADOW, self.outline * 2, cv2.LINE_AA)
-        cv2.polylines(self.c.alpha, [pts], True, 255, self.outline * 2, cv2.LINE_AA)
+        cv2.fillPoly(self.c.color, [pts], self.ivory, cv2.LINE_AA)
+        cv2.fillPoly(self.c.alpha, [pts], self.a, cv2.LINE_AA)
+        cv2.polylines(self.c.color, [pts], True, self.shadow, self.outline * 2, cv2.LINE_AA)
+        cv2.polylines(self.c.alpha, [pts], True, self.a, self.outline * 2, cv2.LINE_AA)
 
     def hole(self, pts: np.ndarray) -> None:
         """Dark cavity (eye sockets, nose)."""
         pts = pts.astype(np.int32).reshape((-1, 1, 2))
-        cv2.fillPoly(self.c.color, [pts], HOLE_DARK, cv2.LINE_AA)
-        cv2.fillPoly(self.c.alpha, [pts], 255, cv2.LINE_AA)
+        cv2.fillPoly(self.c.color, [pts], self.dark, cv2.LINE_AA)
+        cv2.fillPoly(self.c.alpha, [pts], self.a, cv2.LINE_AA)
 
     def crack(self, p1: Point, p2: Point) -> None:
         """Thin dark line on top of bone (teeth gaps)."""
-        cv2.line(self.c.color, p1, p2, BONE_SHADOW, max(1, self.outline), cv2.LINE_AA)
+        cv2.line(self.c.color, p1, p2, self.shadow, max(1, self.outline), cv2.LINE_AA)
 
     def eye_glow(self, p: Point, r: int) -> None:
-        cv2.circle(self.c.glow, p, r * 3, self.aura, -1, cv2.LINE_AA)
-        cv2.circle(self.c.color, p, max(1, r), _brighten(self.aura, 120), -1, cv2.LINE_AA)
+        # The one thing that glows: eyes are a light source, not lit by the room
+        cv2.circle(self.c.glow, p, r * 3, self.eye_color, -1, cv2.LINE_AA)
+        cv2.circle(self.c.color, p, max(1, r), _brighten(self.eye_color, int(120 * self.opacity)), -1, cv2.LINE_AA)
 
 
 class NeonPen:
     """The original glowing-tube look: a colored aura with a hot white-tinted core."""
 
-    def __init__(self, canvas: SkeletonCanvas, color: Tuple[int, int, int], t: float):
+    def __init__(self, canvas: SkeletonCanvas, color: Tuple[int, int, int], t: float, opacity: float = 1.0):
         self.c = canvas
-        self.color = color
-        self.core = _brighten(color)
+        self.color = _scale(color, opacity)
+        self.core = _scale(_brighten(color), opacity)
+        self.dark = _scale(HOLE_DARK, opacity)
+        self.white = _scale((255, 255, 255), opacity)
+        self.a = int(255 * opacity)
         self.t = t
 
     def _core(self, draw, thickness: int) -> None:
         draw(self.c.color, self.core, thickness)
-        draw(self.c.alpha, 255, thickness)
+        draw(self.c.alpha, self.a, thickness)
 
     def bone(self, p1: Point, p2: Point, scale: float = 1.0) -> None:
         th = max(1, int(round(self.t * scale * 0.7)))
@@ -149,8 +157,8 @@ class NeonPen:
 
     def solid(self, pts: np.ndarray) -> None:
         pts = pts.astype(np.int32).reshape((-1, 1, 2))
-        cv2.fillPoly(self.c.color, [pts], HOLE_DARK, cv2.LINE_AA)
-        cv2.fillPoly(self.c.alpha, [pts], 255, cv2.LINE_AA)
+        cv2.fillPoly(self.c.color, [pts], self.dark, cv2.LINE_AA)
+        cv2.fillPoly(self.c.alpha, [pts], self.a, cv2.LINE_AA)
         self.curve(pts, closed=True)
 
     def hole(self, pts: np.ndarray) -> None:
@@ -162,66 +170,11 @@ class NeonPen:
         self.bone(p1, p2, 0.5)
 
     def eye_glow(self, p: Point, r: int) -> None:
-        cv2.circle(self.c.color, p, max(2, r), (255, 255, 255), -1, cv2.LINE_AA)
-
-
-def _pt(kpts: np.ndarray, idx: int) -> Optional[np.ndarray]:
-    x, y, c = kpts[idx]
-    if c < CONF_THRESH or x <= 1 or y <= 1:
-        return None
-    return np.array([x, y], np.float32)
-
-
-def _unit(v: np.ndarray) -> np.ndarray:
-    n = float(np.linalg.norm(v))
-    return v / n if n > 1e-6 else np.array([0.0, -1.0], np.float32)
+        cv2.circle(self.c.color, p, max(2, r), self.white, -1, cv2.LINE_AA)
 
 
 def _perp(u: np.ndarray) -> np.ndarray:
     return np.array([-u[1], u[0]], np.float32)
-
-
-def estimate_head(kpts: np.ndarray) -> Optional[Tuple[np.ndarray, float, float]]:
-    """Returns (center, radius, roll_radians) for the skull.
-
-    The camera mostly sees people from behind, where the eyes and nose are hidden,
-    so this falls back to the ears and finally to the shoulders.
-    """
-    l_sh, r_sh = _pt(kpts, L_SH), _pt(kpts, R_SH)
-    l_hip, r_hip = _pt(kpts, L_HIP), _pt(kpts, R_HIP)
-    sh_mid = (l_sh + r_sh) * 0.5 if l_sh is not None and r_sh is not None else None
-    sh_w = float(np.linalg.norm(l_sh - r_sh)) if sh_mid is not None else 0.0
-
-    up = np.array([0.0, -1.0], np.float32)
-    if sh_mid is not None and l_hip is not None and r_hip is not None:
-        up = _unit(sh_mid - (l_hip + r_hip) * 0.5)
-    roll = math.atan2(up[0], -up[1])
-
-    l_eye, r_eye, nose = _pt(kpts, L_EYE), _pt(kpts, R_EYE), _pt(kpts, NOSE)
-    l_ear, r_ear = _pt(kpts, L_EAR), _pt(kpts, R_EAR)
-
-    if l_eye is not None and r_eye is not None:
-        center = (l_eye + r_eye) * 0.5
-        eye_d = float(np.linalg.norm(l_eye - r_eye))
-        radius = max(eye_d * 1.5, sh_w * 0.32)
-        roll = math.atan2(*(l_eye - r_eye)[::-1])
-        if math.cos(roll) < 0:
-            roll += math.pi
-    elif l_ear is not None and r_ear is not None:
-        ear_d = float(np.linalg.norm(l_ear - r_ear))
-        center = (l_ear + r_ear) * 0.5 + up * ear_d * 0.1
-        radius = max(ear_d * 0.62, sh_w * 0.3)
-    elif nose is not None:
-        center = nose
-        radius = sh_w * 0.32
-    elif sh_mid is not None:
-        center = sh_mid + up * sh_w * 0.62
-        radius = sh_w * 0.3
-    else:
-        return None
-    if radius < 6:
-        return None
-    return center, radius, roll
 
 
 def draw_skull(pen, center: np.ndarray, radius: float, roll: float) -> None:
@@ -303,7 +256,7 @@ def _draw_ribcage(pen, sh_mid, hip_mid, l_sh, r_sh, show_ribs: bool) -> None:
 
 def _draw_limb_pair(pen, a: np.ndarray, b: np.ndarray, gap: float) -> None:
     """Forearm (radius + ulna) and shin (tibia + fibula) are two thin parallel bones."""
-    off = _perp(_unit(b - a)) * gap
+    off = _perp(unit(b - a)) * gap
     pen.bone(_ipt(a + off), _ipt(b + off), 0.55)
     pen.bone(_ipt(a - off), _ipt(b - off), 0.45)
 
@@ -346,13 +299,13 @@ def draw_dancer(pen, d: Dancer, show_skull: bool = True, show_ribs: bool = True)
             pen.knob(_ipt(h), 1.1)
         if kn is not None and an is not None:
             _draw_limb_pair(pen, kn, an, gap)
-            foot = an + _unit(an - kn) * float(np.linalg.norm(an - kn)) * 0.18
+            foot = an + unit(an - kn) * float(np.linalg.norm(an - kn)) * 0.18
             pen.bone(_ipt(an), _ipt(foot), 0.8)
         if kn is not None:
             pen.knob(_ipt(kn), 1.0)
 
     if have_shoulders:
-        neck_base = sh_mid + (_unit(hip_mid - sh_mid) if hip_mid is not None else np.array([0, 1])) * pen.t
+        neck_base = sh_mid + (unit(hip_mid - sh_mid) if hip_mid is not None else np.array([0, 1])) * pen.t
         for sh in (l_sh, r_sh):
             pen.bone(_ipt(sh), _ipt(neck_base), 0.7)
 
@@ -367,7 +320,7 @@ def draw_dancer(pen, d: Dancer, show_skull: bool = True, show_ribs: bool = True)
             if j is not None:
                 pen.knob(_ipt(j), 0.9)
 
-    head = estimate_head(k)
+    head = d.head if d.head is not None else estimate_head(k)
     if head is None:
         return
     center, radius, roll = head
@@ -396,5 +349,6 @@ def draw_dancers(
         idx = d.track_id if d.track_id is not None else i
         color = colors[idx % len(colors)]
         t = thickness_for(d)
-        pen = BonePen(canvas, color, t) if palette_name == "bone" else NeonPen(canvas, color, t)
+        pen_cls = BonePen if palette_name == "bone" else NeonPen
+        pen = pen_cls(canvas, color, t, d.opacity)
         draw_dancer(pen, d, show_skulls, show_ribs)

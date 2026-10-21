@@ -11,16 +11,20 @@ Built for a Mac with Apple Silicon and a TP-Link Tapo camera, but any RTSP camer
 
 ## How it works
 
-1. **Pose detection** (YOLO11 pose) finds each dancer's joints, then tracks and smooths them so the skeletons don't jitter.
-   It's tuned for a camera mounted high in a corner with most people facing *away* from it: the
-   skull is placed from the ears or shoulders when the face isn't visible.
+1. **Pose detection** (YOLO11 pose) finds each dancer's joints, then tracks and smooths them so the
+   skeletons move naturally. Skeletons fade in and out instead of popping, left/right swaps are
+   undone, the skull stays attached to the shoulders, and feet stay planted. It's tuned for a camera
+   mounted high in a corner with most people facing *away* from it: the skull is placed from the
+   ears or shoulders when the face isn't visible.
 2. **Person segmentation** (YOLO11 seg) outlines each person so they can be erased.
 3. **Invisibility cloak.** The camera never moves, so the app keeps learning what the floor looks
    like whenever nobody is standing on a spot. People are replaced with that empty floor, relit to
    match the current party-light colors.
-4. **Skeleton rendering.** Ivory bones with a colored aura: skull, ribcage, vertebrae, pelvis,
-   paired forearm and shin bones, and finger bones. Bones scale with distance from the camera.
-   A neon tube style is also available.
+4. **Skeleton rendering.** Ivory bones: skull, ribcage, vertebrae, pelvis, paired forearm and shin
+   bones, and finger bones. They're lit by the room (purple party light makes purple bones, dim
+   corners make darker bones), matched to the camera's softness and grain, and cast a soft shadow
+   on the floor, so they look like they're in the room rather than pasted on. Bones scale with
+   distance from the camera. A glowing neon tube style is also available.
 
 On an M2 Pro it keeps up with a 15 fps camera at 1080p output.
 
@@ -74,6 +78,18 @@ uv run party-cam --list-displays
   `z`, drag a box around it, and press Enter. Zones are saved in `local/`. Press `x` to clear them.
 - Press `h` to see FPS, how many dancers are detected, and how much of the floor has been learned.
 
+### Recording a test clip
+
+To tune the look without a live party, record a raw clip from the camera and replay it:
+
+```bash
+uv run party-cam-record --seconds 90
+uv run party-cam --source local/clips/clip_<timestamp>.mp4
+```
+
+Clips are saved in `local/clips/` (gitignored) and loop when replayed. Recording uses `ffmpeg` if
+it's installed (`brew install ffmpeg`), which saves the camera's stream as-is with almost no CPU.
+
 ### Hotkeys
 
 | Key | Action |
@@ -99,9 +115,10 @@ uv run party-cam --list-displays
 
 ## Privacy
 
-Nothing is recorded or uploaded. Video stays on your Mac and goes only to your TV over AirPlay.
-Your camera credentials stay in `.env`, and the learned floor image and ignore zones stay in
-`local/`. Both are gitignored.
+Nothing is uploaded, and nothing is recorded unless you run `party-cam-record`. Video stays on
+your Mac and goes only to your TV over AirPlay.
+Your camera credentials stay in `.env`. The learned floor image, ignore zones, and any test clips
+stay in `local/`. Both are gitignored.
 
 ## License
 
