@@ -62,7 +62,6 @@ Model weights download automatically into `models/` on first run.
 ```bash
 uv run party-cam                 # camera from .env
 uv run party-cam --source 0      # Mac webcam, for a quick test
-uv run party-cam --list-displays
 ```
 
 ### Getting it onto the TV (AirPlay)
@@ -70,19 +69,21 @@ uv run party-cam --list-displays
 1. On the Mac: Control Center → **Screen Mirroring** → pick your TV (Apple TV or an AirPlay 2 TV).
 2. In the same menu (or System Settings → Displays), choose **Use As Separate Display**, so the TV
    shows only the party cam while you keep using your laptop screen.
-3. Start it fullscreen on the TV, matching the TV by name:
+3. Start the party cam:
 
    ```bash
-   uv run party-night --display "Living Room"
+   uv run party-night
    ```
 
-   `party-night` is the launcher for the actual party:
-   - It runs `party-cam` (any options are passed through) and keeps the Mac awake.
-   - If the app crashes, or freezes for 45 seconds, it restarts it, fullscreen on the TV again.
-   - Quitting with `q` or Ctrl-C stops it for good.
-   - Everything is logged to `local/logs/` so you can check the morning after.
+4. Drag its window onto the TV and press `f` for fullscreen (macOS's native fullscreen, same as
+   the green button).
 
-   You can also press `d` in the app to move the fullscreen window to the next display.
+`party-night` is the launcher for the actual party:
+- It runs `party-cam` (any options are passed through) and keeps the Mac awake.
+- If the app crashes, or freezes for 45 seconds, it restarts it. After a restart the window opens
+  on the laptop again, so drag it back to the TV and press `f`.
+- Quitting with `q` or Ctrl-C stops it for good.
+- Everything is logged to `local/logs/` so you can check the morning after.
 
 ### Before guests arrive
 
@@ -132,7 +133,7 @@ it's installed (`brew install ffmpeg`), which saves the camera's stream as-is wi
 | `b` | Re-learn the empty floor |
 | `z` / `x` | Add an ignore zone / clear zones |
 | `m` | Mirror |
-| `f` / `d` | Fullscreen / move fullscreen to next display |
+| `f` | Fullscreen (on whichever display the window is on) |
 | `h` | Help and FPS overlay |
 | `q` / `Esc` | Quit |
 

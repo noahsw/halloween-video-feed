@@ -10,7 +10,6 @@ be AirPlayed to a TV.
 Usage:
     uv run party-cam                      # camera from .env (see .env.example)
     uv run party-cam --source 0           # MacBook webcam
-    uv run party-cam --display "TV"       # fullscreen on the display whose name contains "TV"
 
 Live Party Hotkeys (while window is focused):
     1 / 2 / 3 / 4 : Background (1 = Invisible dancers, 2 = Dimmed Room, 3 = Pitch-Black Void, 4 = Spectral Night-Vision)
@@ -22,7 +21,7 @@ Live Party Hotkeys (while window is focused):
     b         : Re-learn the empty dance floor (use if the camera got bumped)
     z         : Draw an ignore zone (e.g. around a skeleton prop); x clears all zones
     m         : Toggle Horizontal Mirroring
-    f         : Toggle Fullscreen;  d : Move fullscreen to the next display
+    f         : Toggle Fullscreen (macOS native; drag the window onto the TV first)
     h         : Toggle help / FPS overlay
     q or ESC  : Quit
 """
@@ -43,7 +42,6 @@ import numpy as np
 from .banner import JoinBanner
 from .cloak import InvisibilityCloak, upscale_region
 from .config import LOCAL_DIR, MODELS_DIR, load_env, redact, rtsp_url_from_env
-from .display import FullscreenController, find_screen, screen_names
 from .interp import Interpolator
 from .macos import keep_process_fast, keep_thread_fast
 from .anatomy import CONF_THRESH, L_AN, L_KN, R_AN, R_KN
@@ -596,7 +594,7 @@ def draw_hud(img: np.ndarray, cam: PartyCam, fps: float) -> None:
         f"{fps:4.1f} fps | {cam.dancer_count} skeletons | floor learned {cam.cloak.coverage * 100:3.0f}%",
         f"style={PALETTE_NAMES[cam.palette_idx]} bg={cam.bg_mode} trails={TRAIL_PRESETS[cam.trail_idx]} zones={len(cam.zones.zones)}",
         "1-4 bg | s skull | r ribs | t trail | c style | j banner | b relearn floor",
-        "z ignore zone | x clear zones | m mirror | f fullscreen | d next display | q quit",
+        "z ignore zone | x clear zones | m mirror | f fullscreen | q quit",
     ]
     for i, text in enumerate(lines):
         y = 28 + i * 26
@@ -623,8 +621,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--room-brightness", type=float, default=0.85, help="Room brightness in invisible mode (0-1)")
     p.add_argument("--fps", type=float, default=30.0,
                    help="Output frame rate; skeleton poses are interpolated between camera frames (0 = camera rate)")  # fmt: skip
-    p.add_argument("--display", help="Start fullscreen on this display (index or name substring, e.g. 'TV')")
-    p.add_argument("--list-displays", action="store_true", help="List displays and exit")
     p.add_argument("--mirror", action="store_true", help="Start mirrored")
     p.add_argument("--no-banner", action="store_true", help="Start with the 'join the dance floor' banner off")
     p.add_argument("--banner-every", type=float, default=30.0, help="Show a banner message about every N seconds")
@@ -636,15 +632,10 @@ def main() -> None:
     args = parse_args()
     load_env()
 
-    if args.list_displays:
-        for i, name in enumerate(screen_names()):
-            print(f"  {i}: {name}")
-        return
-
     source = args.source or rtsp_url_from_env() or "0"
     source_val: str | int = int(source) if source.isdigit() else source
 
-    # Lazy import torch so --help and --list-displays are instant
+    # Lazy import torch so --help is instant
     import torch
 
     device = "mps" if torch.backends.mps.is_available() else ("0" if torch.cuda.is_available() else "cpu")
@@ -657,12 +648,6 @@ def main() -> None:
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, 1280, 720)
-    fullscreen = FullscreenController(WINDOW_NAME)
-    pending_display = None
-    if args.display is not None:
-        pending_display = find_screen(args.display)
-        if pending_display is None:
-            print(f"[!] No display matching '{args.display}'. Available: {screen_names()}")
 
     worker = DetectionWorker(cam, stream)
     worker.start()
@@ -714,9 +699,6 @@ def main() -> None:
                 t_show = time.perf_counter()
                 cv2.imshow(WINDOW_NAME, display)
                 stats.frame_shown(cam, time.perf_counter() - t_show)
-                if pending_display is not None:
-                    fullscreen.enter(pending_display)
-                    pending_display = None
 
             if time.time() - last_save > 60:
                 cam.cloak.save(background=True)
@@ -755,14 +737,9 @@ def main() -> None:
                 cam.zones.clear()
                 print("[*] Cleared ignore zones")
             elif key == ord("f"):
-                if fullscreen.is_fullscreen:
-                    fullscreen.exit()
-                else:
-                    fullscreen.enter(fullscreen.screen_index or 0)
-            elif key == ord("d"):
-                idx = fullscreen.cycle()
-                if idx is not None:
-                    print(f"[*] Fullscreen on display {idx}: {screen_names()[idx]}")
+                # OpenCV uses macOS native fullscreen, on whichever display the window is on
+                is_full = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN) == cv2.WINDOW_FULLSCREEN
+                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL if is_full else cv2.WINDOW_FULLSCREEN)
     except KeyboardInterrupt:
         pass  # Ctrl-C in the terminal: quit quietly, cleanup below still runs
     finally:

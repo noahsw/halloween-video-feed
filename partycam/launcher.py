@@ -1,6 +1,6 @@
 """Party-night launcher: runs the party cam and brings it back if it crashes or freezes.
 
-    uv run party-night --display SONY
+    uv run party-night
 
 Any arguments are passed straight to party-cam. Quitting with 'q' (or Ctrl-C here) stops for
 good; a crash, or no [perf] heartbeat for a while, restarts it after a short pause. Keeps the
