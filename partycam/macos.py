@@ -36,6 +36,19 @@ def keep_process_fast(reason: str = "Party cam is live") -> None:
     keep_thread_fast()
 
 
+def thermal_state() -> str:
+    """macOS's own thermal verdict: nominal, fair, serious or critical ("?" if unavailable).
+    At serious and above, macOS slows the CPU and GPU to cool down."""
+    if sys.platform != "darwin":
+        return "?"
+    try:
+        from Foundation import NSProcessInfo  # type: ignore[import-not-found]
+
+        return ("nominal", "fair", "serious", "critical")[int(NSProcessInfo.processInfo().thermalState())]
+    except Exception:
+        return "?"
+
+
 def keep_thread_fast() -> None:
     """Marks the calling thread as user-interactive. Call at the start of each worker thread."""
     if sys.platform != "darwin":

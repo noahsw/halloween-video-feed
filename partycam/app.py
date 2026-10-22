@@ -43,7 +43,7 @@ from .banner import JoinBanner
 from .cloak import InvisibilityCloak, upscale_region
 from .config import LOCAL_DIR, MODELS_DIR, load_env, redact, rtsp_url_from_env
 from .interp import Interpolator
-from .macos import keep_process_fast, keep_thread_fast
+from .macos import keep_process_fast, keep_thread_fast, thermal_state
 from .anatomy import CONF_THRESH, L_AN, L_KN, R_AN, R_KN
 from .skeleton import PALETTE_NAMES, SkeletonCanvas, draw_dancers
 from .modelprocs import POSE, SEGMENT, ModelProcess, SharedFrame, detect_poses, half_shape, segment_people
@@ -581,7 +581,8 @@ class PerfLog:
             f" | detect {np.mean(self.detect) * 1000:3.0f} (pose {np.mean(self.pose) * 1000:3.0f},"
             f" seg wait {np.mean(self.seg_wait or [0]) * 1000:3.0f}), erase {np.mean(self.erase) * 1000:3.0f},"
             f" draw {np.mean(self.render) * 1000:3.0f},"
-            f" show {np.mean(self.show) * 1000:3.0f}/{np.max(self.show) * 1000:3.0f} ms | skeletons {max(self.dancers)}",
+            f" show {np.mean(self.show) * 1000:3.0f}/{np.max(self.show) * 1000:3.0f} ms | skeletons {max(self.dancers)}"
+            f" | thermal {thermal_state()}",
             flush=True,
         )
         self.start, self.start_id, self.start_seq = now, frame_id, seq
@@ -619,6 +620,8 @@ def parse_args() -> argparse.Namespace:
                    help="Let the GPU idle between frames: saves power on battery, but macOS then slows it ~30%%")  # fmt: skip
     p.add_argument("--width", type=int, default=1920, help="Processing/output width (camera frames are downscaled to this)")
     p.add_argument("--room-brightness", type=float, default=0.85, help="Room brightness in invisible mode (0-1)")
+    p.add_argument("--fullscreen", action="store_true",
+                   help="Start fullscreen (on the display the window opens on; with the lid closed, the TV)")  # fmt: skip
     p.add_argument("--fps", type=float, default=30.0,
                    help="Output frame rate; skeleton poses are interpolated between camera frames (0 = camera rate)")  # fmt: skip
     p.add_argument("--mirror", action="store_true", help="Start mirrored")
@@ -658,6 +661,7 @@ def main() -> None:
     fps, frames, fps_t = 0.0, 0, time.time()
     analysis: Optional[Analysis] = None
     stats = PerfLog(stream, worker)
+    started_fullscreen = False
     # Output frames are drawn on their own clock (--fps), interpolating poses between camera frames
     interp = Interpolator()
     frame_dt = 1.0 / args.fps if args.fps > 0 else 0.0
@@ -699,6 +703,11 @@ def main() -> None:
                 t_show = time.perf_counter()
                 cv2.imshow(WINDOW_NAME, display)
                 stats.frame_shown(cam, time.perf_counter() - t_show)
+                if args.fullscreen and not started_fullscreen:
+                    # After the first frame, so the window exists. With the lid closed the TV is the
+                    # only display, so this lands there, also after the launcher restarts the app.
+                    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                    started_fullscreen = True
 
             if time.time() - last_save > 60:
                 cam.cloak.save(background=True)

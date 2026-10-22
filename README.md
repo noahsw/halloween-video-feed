@@ -64,25 +64,35 @@ uv run party-cam                 # camera from .env
 uv run party-cam --source 0      # Mac webcam, for a quick test
 ```
 
-### Getting it onto the TV (AirPlay)
+### Getting it onto the TV
 
-1. On the Mac: Control Center → **Screen Mirroring** → pick your TV (Apple TV or an AirPlay 2 TV).
-2. In the same menu (or System Settings → Displays), choose **Use As Separate Display**, so the TV
-   shows only the party cam while you keep using your laptop screen.
-3. Start the party cam:
+**HDMI cable (recommended).** AirPlay compresses the whole picture to stream it over Wi-Fi, so
+fine textures like a shaggy rug break into blocks, and it gets worse when a house full of phones
+shares the Wi-Fi. A cable has none of that. It also lets the Mac run with the lid closed: macOS
+keeps a closed MacBook awake when it's on **power** with a **wired** display attached, and the TV
+becomes its only screen.
+
+1. Plug in the charger and the HDMI cable. Set the TV to that HDMI input.
+2. Start the party cam fullscreen:
 
    ```bash
-   uv run party-night
+   uv run party-night --fullscreen
    ```
 
-4. Drag its window onto the TV and press `f` for fullscreen (macOS's native fullscreen, same as
-   the green button).
+3. Close the lid if you're short on space. Give the Mac some airflow: keep the vents on the bottom
+   sides and behind the hinge clear, don't enclose it, and use a hard surface or a vertical stand.
+   The `[perf]` line shows macOS's thermal state; anything past `nominal` means it's getting warm
+   and will start slowing down.
+
+**AirPlay.** Control Center → **Screen Mirroring** → your TV → **Use As Separate Display**. Then run
+`uv run party-night`, drag the window onto the TV, and press `f`. The lid has to stay open.
 
 `party-night` is the launcher for the actual party:
 - It runs `party-cam` (any options are passed through) and keeps the Mac awake.
-- If the app crashes, or freezes for 45 seconds, it restarts it. After a restart the window opens
-  on the laptop again, so drag it back to the TV and press `f`.
-- Quitting with `q` or Ctrl-C stops it for good.
+- If the app crashes, or freezes for 45 seconds, it restarts it. With `--fullscreen` it comes back
+  fullscreen on its own. That's on the TV when the lid is closed, since the TV is the only screen.
+- Quitting with `q` or Ctrl-C stops it for good. With the lid closed, use an external keyboard,
+  or open the lid.
 - Everything is logged to `local/logs/` so you can check the morning after.
 
 ### Before guests arrive
