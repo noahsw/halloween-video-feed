@@ -159,6 +159,18 @@ it's installed (`brew install ffmpeg`), which saves the camera's stream as-is wi
 - `--no-gpu-warm`: let the GPU idle between frames. Saves power on battery, but frames get
   slower after about a minute. Keep the Mac plugged in for the party instead.
 
+## Tests
+
+```bash
+uv run pytest
+```
+
+About 60 tests that run in a few seconds, with no camera or GPU needed. They cover the logic that's
+easy to break without noticing: credential redaction in logs, the ignore-zone rule, skeleton
+tracking (fades, left/right swaps, smoothing), the in-between poses, message rotation, and the
+launcher's restart behavior. How it looks and how fast it runs are checked by eye and by the
+`[perf]` line instead.
+
 ## Privacy
 
 Nothing is uploaded, and nothing is recorded unless you run `party-cam-record`. Video stays on

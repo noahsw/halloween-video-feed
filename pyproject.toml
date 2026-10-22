@@ -28,3 +28,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["partycam"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
