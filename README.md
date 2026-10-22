@@ -119,6 +119,22 @@ Half the time, the message fits the moment:
 Edit or add your own in [partycam/messages.py](partycam/messages.py). Use `--banner-every 45` to
 show them less often, or press `j` to turn them off.
 
+### Surprise cameos
+
+Every few minutes (about 3 on average, never while a message is up), something brief happens:
+
+- **Bats.** One bat, or a small group, flits across the top of the picture along the ceiling in a
+  few seconds. They're soft dark silhouettes, so they read as something in the room.
+- **A skeleton dog.** It fades in at one end of the dance floor, trots partway across, stops to
+  look up at the dancers and bark with its tail wagging, then trots on and fades out. It's lit by the
+  room like the dancers, casts a shadow, and walks behind or in front of people depending on where
+  they stand. It learns where the floor is and how big things look there from where dancers'
+  feet have been, so it walks on the floor at the right size.
+
+Bats come up about twice as often as the dog, and the dog never appears twice in a row. Press `v`
+or `d` to bring one on right away. Use `--cameo-every 300` to make them rarer, or `--no-cameos` to
+turn them off (`v` and `d` still work).
+
 ### Recording a test clip
 
 To tune the look without a live party, record a raw clip from the camera and replay it:
@@ -140,6 +156,7 @@ it's installed (`brew install ffmpeg`), which saves the camera's stream as-is wi
 | `s` / `r` | Toggle skulls / ribcages |
 | `t` | Phantom trail length for the current style (medium → long → short → off). Off by default for bone, medium for neon |
 | `j` | Toggle the "join the dance floor" banner |
+| `v` / `d` | Send in the bats / the skeleton dog now |
 | `b` | Re-learn the empty floor |
 | `z` / `x` | Add an ignore zone / clear zones |
 | `m` | Mirror |
@@ -165,11 +182,11 @@ it's installed (`brew install ffmpeg`), which saves the camera's stream as-is wi
 uv run pytest
 ```
 
-About 60 tests that run in a few seconds, with no camera or GPU needed. They cover the logic that's
+About 70 tests that run in a few seconds, with no camera or GPU needed. They cover the logic that's
 easy to break without noticing: credential redaction in logs, the ignore-zone rule, skeleton
-tracking (fades, left/right swaps, smoothing), the in-between poses, message rotation, and the
-launcher's restart behavior. How it looks and how fast it runs are checked by eye and by the
-`[perf]` line instead.
+tracking (fades, left/right swaps, smoothing), the in-between poses, message rotation, cameo
+timing and the dog's walk, and the launcher's restart behavior. How it looks and how fast it runs
+are checked by eye and by the `[perf]` line instead.
 
 ## Privacy
 

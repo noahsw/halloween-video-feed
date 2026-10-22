@@ -18,6 +18,7 @@ Live Party Hotkeys (while window is focused):
     t         : Cycle Phantom Trail persistence (Medium -> Long Ghost Echo -> Short -> Off); off by default for bone style
     c         : Cycle Skeleton Style (Bone, Multi-Dancer Neon, Ecto-Green, Phantom Cyan/Purple, Hellfire Orange)
     j         : Toggle "Join the dance floor" banner
+    v / d     : Send in the bats / the skeleton dog now (they also show up on their own every few minutes)
     b         : Re-learn the empty dance floor (use if the camera got bumped)
     z         : Draw an ignore zone (e.g. around a skeleton prop); x clears all zones
     m         : Toggle Horizontal Mirroring
@@ -34,12 +35,13 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 from .banner import JoinBanner
+from .cameos import BATS, DOG, Cameos, Shadow
 from .cloak import InvisibilityCloak, upscale_region
 from .config import LOCAL_DIR, MODELS_DIR, load_env, redact, rtsp_url_from_env
 from .interp import Interpolator
@@ -118,6 +120,7 @@ class PartyCam:
             self.cloak.plate_path.unlink(missing_ok=True)
         self.zones = IgnoreZones(LOCAL_DIR / "ignore_zones.json")
         self.banner = JoinBanner(every=args.banner_every)
+        self.cameos = Cameos(every=args.cameo_every, enabled=not args.no_cameos)
 
         self.bg_mode = BG_INVISIBLE
         self.show_skulls = True
@@ -355,10 +358,19 @@ class PartyCam:
         bg = a.bg
         canvas = SkeletonCanvas(a.frame.shape)
         palette = PALETTE_NAMES[self.palette_idx]
-        draw_dancers(canvas, dancers, palette, self.show_skulls, self.show_ribs)
+        # Cameos wait while a banner message is up, so there's only ever one thing to look at
+        self.cameos.update(now, a.frame.shape, dancers, quiet=not self.show_banner or self.banner.current is None)
+        dog = self.cameos.dog
+        if dog is None:
+            draw_dancers(canvas, dancers, palette, self.show_skulls, self.show_ribs)
+        else:
+            # The dog walks between the dancers: behind the ones nearer the camera, in front of the rest
+            draw_dancers(canvas, [d for d in dancers if d.box[3] < dog.gy], palette, self.show_skulls, self.show_ribs)
+            dog.draw(canvas, palette)
+            draw_dancers(canvas, [d for d in dancers if d.box[3] >= dog.gy], palette, self.show_skulls, self.show_ribs)
         if palette == "bone":
             # Neon emits its own light; bones should look like they're in the room
-            bg = self.floor_shadows(bg, dancers)
+            bg = self.floor_shadows(bg, dancers, [dog.shadow()] if dog is not None else [])
             self.light_skeletons(canvas, bg)
         if a.motion is not None:
             canvas.glow[a.motion > 0] = (90, 45, 15)
@@ -369,13 +381,14 @@ class PartyCam:
         # Everything above runs un-mirrored so the learned floor and ignore zones never depend on it
         if self.mirror:
             out = cv2.flip(out, 1)
+        self.cameos.draw_overlay(out, now)
         if self.show_banner:
             self.banner.draw(out, now, self.dancer_count)
         self.timings["render"] = time.perf_counter() - t0
         return out
 
-    def floor_shadows(self, bg: np.ndarray, dancers: List[Dancer]) -> np.ndarray:
-        """Soft contact shadow under each skeleton's feet, so they stand on the floor."""
+    def floor_shadows(self, bg: np.ndarray, dancers: List[Dancer], extra: Sequence[Shadow] = ()) -> np.ndarray:
+        """Soft contact shadow under each skeleton's feet (and any `extra` ones), so they stand on the floor."""
         h, w = bg.shape[:2]
         sw, sh = w // 4, h // 4
         shadow = np.zeros((sh, sw), np.uint8)
@@ -388,6 +401,8 @@ class PartyCam:
             center = (int(base[0] / 4), int((base[1] + d.height * 0.015) / 4))
             axes = (max(1, int(half_w / 4)), max(1, int(half_w * 0.3 / 4)))
             cv2.ellipse(shadow, center, axes, 0, 0, 360, int(120 * d.opacity), -1)
+        for (cx, cy), (ax, ay), strength in extra:
+            cv2.ellipse(shadow, (int(cx / 4), int(cy / 4)), (max(1, int(ax / 4)), max(1, int(ay / 4))), 0, 0, 360, int(120 * strength), -1)
         if not shadow.any():
             return bg
         shadow = cv2.resize(cv2.GaussianBlur(shadow, (0, 0), max(1.0, sh / 150)), (w, h), interpolation=cv2.INTER_LINEAR)
@@ -594,7 +609,7 @@ def draw_hud(img: np.ndarray, cam: PartyCam, fps: float) -> None:
     lines = [
         f"{fps:4.1f} fps | {cam.dancer_count} skeletons | floor learned {cam.cloak.coverage * 100:3.0f}%",
         f"style={PALETTE_NAMES[cam.palette_idx]} bg={cam.bg_mode} trails={TRAIL_PRESETS[cam.trail_idx]} zones={len(cam.zones.zones)}",
-        "1-4 bg | s skull | r ribs | t trail | c style | j banner | b relearn floor",
+        "1-4 bg | s skull | r ribs | t trail | c style | j banner | v bats | d dog | b relearn floor",
         "z ignore zone | x clear zones | m mirror | f fullscreen | q quit",
     ]
     for i, text in enumerate(lines):
@@ -627,6 +642,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mirror", action="store_true", help="Start mirrored")
     p.add_argument("--no-banner", action="store_true", help="Start with the 'join the dance floor' banner off")
     p.add_argument("--banner-every", type=float, default=30.0, help="Show a banner message about every N seconds")
+    p.add_argument("--no-cameos", action="store_true", help="No surprise bats or skeleton dog (v / d still summon them)")
+    p.add_argument("--cameo-every", type=float, default=180.0, help="Average seconds between surprise bats / skeleton dog")
     p.add_argument("--fresh-background", action="store_true", help="Forget the saved empty-floor image")
     return p.parse_args()
 
@@ -728,6 +745,10 @@ def main() -> None:
                 cam.palette_idx = (cam.palette_idx + 1) % len(PALETTE_NAMES)
             elif key == ord("j"):
                 cam.show_banner = not cam.show_banner
+            elif key == ord("v"):
+                cam.cameos.trigger(BATS)
+            elif key == ord("d"):
+                cam.cameos.trigger(DOG)
             elif key == ord("h"):
                 show_hud = not show_hud
             elif key == ord("b"):

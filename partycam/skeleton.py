@@ -353,6 +353,11 @@ def draw_dancer(pen, d: Dancer, show_skull: bool = True, show_ribs: bool = True)
         draw_skull(pen, center, radius, roll)
 
 
+def make_pen(canvas: SkeletonCanvas, palette_name: str, color: Tuple[int, int, int], t: float, opacity: float = 1.0):
+    pen_cls = BonePen if palette_name == "bone" else NeonPen
+    return pen_cls(canvas, color, t, opacity)
+
+
 def thickness_for(d: Dancer) -> float:
     """Bone thickness scales with how big the dancer appears (near vs far from the camera)."""
     return float(np.clip(d.height / 48.0, 2.0, 18.0))
@@ -370,7 +375,4 @@ def draw_dancers(
     for i, d in enumerate(sorted(dancers, key=lambda d: d.box[3])):
         idx = d.track_id if d.track_id is not None else i
         color = colors[idx % len(colors)]
-        t = thickness_for(d)
-        pen_cls = BonePen if palette_name == "bone" else NeonPen
-        pen = pen_cls(canvas, color, t, d.opacity)
-        draw_dancer(pen, d, show_skulls, show_ribs)
+        draw_dancer(make_pen(canvas, palette_name, color, thickness_for(d), d.opacity), d, show_skulls, show_ribs)
