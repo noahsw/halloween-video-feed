@@ -19,6 +19,7 @@ Live Party Hotkeys (while window is focused):
     c         : Cycle Skeleton Style (Bone, Multi-Dancer Neon, Ecto-Green, Phantom Cyan/Purple, Hellfire Orange)
     j         : Toggle "Join the dance floor" banner
     v / d     : Send in the bats / the skeleton dog now (they also show up on their own every few minutes)
+    p         : Cut to the next missing-person poster now (they also cut in on their own every ~10 minutes)
     b         : Re-learn the empty dance floor (use if the camera got bumped)
     z         : Draw an ignore zone (e.g. around a skeleton prop); x clears all zones
     m         : Toggle Horizontal Mirroring
@@ -48,6 +49,7 @@ from .interp import Interpolator
 from .macos import keep_process_fast, keep_thread_fast, thermal_state
 from .anatomy import CONF_THRESH, L_AN, L_KN, R_AN, R_KN
 from .skeleton import PALETTE_NAMES, SkeletonCanvas, draw_dancers
+from .posters import MissingPosters
 from .modelprocs import POSE, SEGMENT, ModelProcess, SharedFrame, detect_poses, half_shape, segment_people
 from .stream import LowLatencyStreamReader
 from .tracking import Dancer, PoseSmoother
@@ -121,6 +123,8 @@ class PartyCam:
         self.zones = IgnoreZones(LOCAL_DIR / "ignore_zones.json")
         self.banner = JoinBanner(every=args.banner_every)
         self.cameos = Cameos(every=args.cameo_every, enabled=not args.no_cameos)
+        self.posters = MissingPosters(LOCAL_DIR / "missing", every=args.poster_every, enabled=not args.no_posters)
+        print(f"[*] {len(self.posters.paths)} missing-person posters in {LOCAL_DIR / 'missing'}")
 
         self.bg_mode = BG_INVISIBLE
         self.show_skulls = True
@@ -358,8 +362,11 @@ class PartyCam:
         bg = a.bg
         canvas = SkeletonCanvas(a.frame.shape)
         palette = PALETTE_NAMES[self.palette_idx]
-        # Cameos wait while a banner message is up, so there's only ever one thing to look at
-        self.cameos.update(now, a.frame.shape, dancers, quiet=not self.show_banner or self.banner.current is None)
+        # Banners, cameos and posters wait for each other, so there's only ever one thing to look at
+        banner_up = self.show_banner and self.banner.current is not None
+        self.posters.update(now, quiet=not banner_up and not self.cameos.active)
+        poster_up = self.posters.busy(now)
+        self.cameos.update(now, a.frame.shape, dancers, quiet=not banner_up and not poster_up)
         dog = self.cameos.dog
         if dog is None:
             draw_dancers(canvas, dancers, palette, self.show_skulls, self.show_ribs)
@@ -382,8 +389,9 @@ class PartyCam:
         if self.mirror:
             out = cv2.flip(out, 1)
         self.cameos.draw_overlay(out, now)
-        if self.show_banner:
+        if self.show_banner and not poster_up:
             self.banner.draw(out, now, self.dancer_count)
+        self.posters.draw(out, now)
         self.timings["render"] = time.perf_counter() - t0
         return out
 
@@ -609,7 +617,7 @@ def draw_hud(img: np.ndarray, cam: PartyCam, fps: float) -> None:
     lines = [
         f"{fps:4.1f} fps | {cam.dancer_count} skeletons | floor learned {cam.cloak.coverage * 100:3.0f}%",
         f"style={PALETTE_NAMES[cam.palette_idx]} bg={cam.bg_mode} trails={TRAIL_PRESETS[cam.trail_idx]} zones={len(cam.zones.zones)}",
-        "1-4 bg | s skull | r ribs | t trail | c style | j banner | v bats | d dog | b relearn floor",
+        "1-4 bg | s skull | r ribs | t trail | c style | j banner | v bats | d dog | p poster | b relearn floor",
         "z ignore zone | x clear zones | m mirror | f fullscreen | q quit",
     ]
     for i, text in enumerate(lines):
@@ -644,6 +652,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--banner-every", type=float, default=30.0, help="Show a banner message about every N seconds")
     p.add_argument("--no-cameos", action="store_true", help="No surprise bats or skeleton dog (v / d still summon them)")
     p.add_argument("--cameo-every", type=float, default=180.0, help="Average seconds between surprise bats / skeleton dog")
+    p.add_argument("--no-posters", action="store_true", help="No missing-person posters on their own (p still cuts to one)")
+    p.add_argument("--poster-every", type=float, default=600.0, help="Average seconds between missing-person posters")
     p.add_argument("--fresh-background", action="store_true", help="Forget the saved empty-floor image")
     return p.parse_args()
 
@@ -749,6 +759,8 @@ def main() -> None:
                 cam.cameos.trigger(BATS)
             elif key == ord("d"):
                 cam.cameos.trigger(DOG)
+            elif key == ord("p"):
+                cam.posters.trigger()
             elif key == ord("h"):
                 show_hud = not show_hud
             elif key == ord("b"):

@@ -135,6 +135,20 @@ Bats come up about twice as often as the dog, and the dog never appears twice in
 or `d` to bring one on right away. Use `--cameo-every 300` to make them rarer, or `--no-cameos` to
 turn them off (`v` and `d` still work).
 
+### Missing-person posters
+
+Put poster images (JPG, PNG or WebP) in `local/missing/`. About every 10 minutes, one cuts in
+like an emergency broadcast: a burst of static, then the poster for 15 seconds under a red
+"MISSING PERSON ALERT" bar, with "FULL CASE FILE POSTED IN THE RESTROOMS" along the bottom. It
+zooms in slowly while it's up, then cuts back out through static. The first one shows up 1½ to 3
+minutes after starting, so you can check it worked.
+
+Every poster shows once before any repeats. Posters, banner messages and cameos wait for each
+other, so only one is on screen at a time. Press `p` to cut to the next poster right away, for
+example when someone whose poster it is walks in. Use `--poster-every 900` to show them less
+often, or `--no-posters` to turn them off (`p` still works). `local/` is gitignored, so your
+guests' photos never get committed.
+
 ### Recording a test clip
 
 To tune the look without a live party, record a raw clip from the camera and replay it:
@@ -157,6 +171,7 @@ it's installed (`brew install ffmpeg`), which saves the camera's stream as-is wi
 | `t` | Phantom trail length for the current style (medium → long → short → off). Off by default for bone, medium for neon |
 | `j` | Toggle the "join the dance floor" banner |
 | `v` / `d` | Send in the bats / the skeleton dog now |
+| `p` | Cut to the next missing-person poster now |
 | `b` | Re-learn the empty floor |
 | `z` / `x` | Add an ignore zone / clear zones |
 | `m` | Mirror |
@@ -182,18 +197,18 @@ it's installed (`brew install ffmpeg`), which saves the camera's stream as-is wi
 uv run pytest
 ```
 
-About 70 tests that run in a few seconds, with no camera or GPU needed. They cover the logic that's
+About 80 tests that run in a few seconds, with no camera or GPU needed. They cover the logic that's
 easy to break without noticing: credential redaction in logs, the ignore-zone rule, skeleton
 tracking (fades, left/right swaps, smoothing), the in-between poses, message rotation, cameo
-timing and the dog's walk, and the launcher's restart behavior. How it looks and how fast it runs
+and poster timing, the dog's walk, and the launcher's restart behavior. How it looks and how fast it runs
 are checked by eye and by the `[perf]` line instead.
 
 ## Privacy
 
 Nothing is uploaded, and nothing is recorded unless you run `party-cam-record`. Video stays on
 your Mac and goes only to your TV over AirPlay.
-Your camera credentials stay in `.env`. The learned floor image, ignore zones, and any test clips
-stay in `local/`. Both are gitignored.
+Your camera credentials stay in `.env`. The learned floor image, ignore zones, missing-person posters,
+and any test clips stay in `local/`. Both are gitignored.
 
 ## License
 
