@@ -88,7 +88,8 @@ becomes its only screen.
 `uv run party-night`, drag the window onto the TV, and press `f`. The lid has to stay open.
 
 `party-night` is the launcher for the actual party:
-- It runs `party-cam` (any options are passed through) and keeps the Mac awake.
+- It runs `party-cam` (any options are passed through). `party-cam` keeps the Mac and the TV
+  awake on its own while it runs; the launcher also keeps them awake between restarts.
 - If the app crashes, or freezes for 45 seconds, it restarts it. With `--fullscreen` it comes back
   fullscreen on its own. That's on the TV when the lid is closed, since the TV is the only screen.
 - Quitting with `q` or Ctrl-C stops it for good. With the lid closed, use an external keyboard,

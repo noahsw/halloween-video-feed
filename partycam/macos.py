@@ -4,6 +4,8 @@ macOS slows down work it thinks is in the background: App Nap, timer coalescing,
 CPU/GPU scheduling for processes and threads without a "user interactive" quality of service.
 Unchecked, that shows up as detection randomly taking twice as long for half a minute at a
 time, and choppy video. A latency-critical activity plus interactive thread QoS opts out.
+The same activity keeps the system and the display from idle-sleeping: with the lid closed the TV
+is the only display, and it would otherwise go black after a few minutes without input.
 """
 
 import ctypes
@@ -13,6 +15,7 @@ from typing import Any, Optional
 # From Foundation's NSProcessInfo.h
 NS_ACTIVITY_USER_INITIATED = 0x00FFFFFF | (1 << 20)  # includes NSActivityIdleSystemSleepDisabled
 NS_ACTIVITY_LATENCY_CRITICAL = 0xFF00000000
+NS_ACTIVITY_IDLE_DISPLAY_SLEEP_DISABLED = 1 << 40
 # From <sys/qos.h>
 QOS_CLASS_USER_INTERACTIVE = 0x21
 
@@ -29,7 +32,7 @@ def keep_process_fast(reason: str = "Party cam is live") -> None:
             from Foundation import NSProcessInfo  # type: ignore[import-not-found]
 
             _activity = NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
-                NS_ACTIVITY_USER_INITIATED | NS_ACTIVITY_LATENCY_CRITICAL, reason
+                NS_ACTIVITY_USER_INITIATED | NS_ACTIVITY_LATENCY_CRITICAL | NS_ACTIVITY_IDLE_DISPLAY_SLEEP_DISABLED, reason
             )
         except Exception as e:  # pyobjc missing: still run, just maybe throttled
             print(f"[!] Couldn't ask macOS not to throttle the party cam: {e}")
