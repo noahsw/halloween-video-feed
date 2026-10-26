@@ -139,7 +139,7 @@ turn them off (`v` and `d` still work).
 ### Missing-person posters
 
 Put poster images (JPG, PNG or WebP) in `local/missing/`. About every 10 minutes, one cuts in
-like an emergency broadcast: a burst of static, then the poster for 15 seconds under a red
+like an emergency broadcast: a burst of static, then the poster for a minute under a red
 "MISSING PERSON ALERT" bar, with "FULL CASE FILE POSTED IN THE RESTROOMS" along the bottom. It
 zooms in slowly while it's up, then cuts back out through static. The first one shows up 1½ to 3
 minutes after starting, so you can check it worked.

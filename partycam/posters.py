@@ -2,7 +2,7 @@
 
 Drop poster images in local/missing/ (gitignored: they're photos of your guests). About every
 10 minutes one cuts in through a burst of static, under a red "MISSING PERSON ALERT" bar, holds
-for 15 seconds with a slow push-in, and cuts back out. Every poster shows once before any
+for a minute with a slow push-in, and cuts back out. Every poster shows once before any
 repeats. They wait for a banner message or cameo to finish, so there's only ever one thing on
 screen, and keep the next banner or cameo back for a few seconds after.
 """
@@ -75,7 +75,7 @@ class MissingPosters:
     BAR = 0.065  # alert bar height, as a fraction of the frame
     CAPTION_BAR = 0.05
 
-    def __init__(self, folder: Path, every: float = 600.0, show_for: float = 15.0, enabled: bool = True, seed: Optional[int] = None):
+    def __init__(self, folder: Path, every: float = 600.0, show_for: float = 60.0, enabled: bool = True, seed: Optional[int] = None):
         self.paths = find_posters(folder)
         self.every = max(every, show_for + 1.0)
         self.show_for = show_for
